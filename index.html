@@ -1,0 +1,1536 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bamboo Run</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #1d2b1f;
+    overflow: hidden;
+  }
+  body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  canvas {
+    display: block;
+    border-radius: 6px;
+    box-shadow: 0 0 30px rgba(0, 0, 0, 0.5);
+    outline: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="game" width="800" height="400" tabindex="0" aria-label="Bamboo Run game"></canvas>
+
+<script>
+"use strict";
+
+/* =====================================================================
+   BAMBOO RUN
+   A tiny endless-runner starring a panda. Everything (graphics, sound,
+   logic) lives in this one file. Open it in a browser to play.
+
+   Sections:
+     1. CONFIG          - every number you might want to tweak
+     2. Helpers         - small math / drawing utilities
+     3. Sound           - beeps made with the Web Audio API
+     4. Panda           - the player: physics, hitbox and drawing
+     5. Obstacle        - rocks (jump over) and branches (duck under)
+     6. Bamboo          - the collectibles
+     7. Background      - parallax sky, mountains, forest and ground
+     8. Game            - state machine, spawning, collisions, UI
+     9. Startup         - canvas scaling, keyboard input, main loop
+   ===================================================================== */
+
+
+/* =====================================================================
+   1. CONFIG - all tunable values in one place
+   Units: pixels, seconds, and pixels-per-second (px/s).
+   ===================================================================== */
+const CONFIG = {
+  // --- Canvas / world ---
+  WIDTH: 800,                // internal drawing width (scaled to fit window)
+  HEIGHT: 400,               // internal drawing height
+  GROUND_Y: 340,             // y coordinate of the ground surface
+
+  // --- Goal ---
+  WIN_TARGET: 50,            // bamboo sticks needed to win
+
+  // --- Panda size & physics ---
+  PANDA_X: 170,              // fixed horizontal position (left third of screen)
+  PANDA_WIDTH: 56,           // drawn width while standing / running
+  PANDA_HEIGHT: 76,          // drawn height while standing / running
+  PANDA_DUCK_WIDTH: 66,      // drawn width while ducking (wider, squashed)
+  PANDA_DUCK_HEIGHT: 42,     // drawn height while ducking (clearly shorter)
+  GRAVITY: 2200,             // downward acceleration (px/s^2)
+  JUMP_VELOCITY: 820,        // upward speed at the start of a jump (px/s)
+  FAST_DROP_MULTIPLIER: 3.2, // gravity multiplier while holding Down in the air
+  JUMP_BUFFER_TIME: 0.12,    // a jump pressed this long before landing still counts
+  RUN_ANIM_FPS: 12,          // leg animation speed at the starting scroll speed
+
+  // --- Scroll speed / difficulty ---
+  START_SPEED: 320,          // starting scroll speed (px/s)
+  SPEED_STEP: 40,            // speed added at each difficulty step
+  SPEED_STEP_EVERY: 10,      // a difficulty step happens every N bamboo
+  MAX_SPEED: 560,            // speed never goes above this
+  TITLE_SCROLL_SPEED: 60,    // gentle background scroll on the title screen
+
+  // --- Obstacle spawning (all gaps are measured in seconds of travel time) ---
+  FIRST_OBSTACLE_DELAY: 1.8, // seconds before the very first obstacle
+  MIN_OBSTACLE_GAP: 1.0,     // GUARANTEED minimum time between two obstacles
+  MIXED_GAP_BONUS: 0.3,      // extra time when a rock and a branch follow each other
+  RANDOM_GAP: 1.2,           // up to this much random extra time between obstacles
+  RANDOM_GAP_SHRINK: 0.15,   // random extra shrinks by this much per difficulty step
+  RANDOM_GAP_MIN: 0.35,      // ...but never below this
+  BRANCH_CHANCE: 0.4,        // probability that an obstacle is a branch (else rock)
+
+  // --- Rocks ---
+  ROCK_SIZES: [              // small and medium; all are jumpable (checked at startup)
+    { w: 34, h: 26 },
+    { w: 40, h: 31 },
+    { w: 46, h: 36 },
+  ],
+
+  // --- Branches ---
+  BRANCH_WIDTH: 110,         // horizontal size of the leafy branch
+  BRANCH_THICKNESS: 40,      // vertical size of the leafy part (its hitbox)
+  BRANCH_CLEARANCE: 50,      // gap between ground and the lowest leaves
+
+  // --- Bamboo ---
+  BAMBOO_WIDTH: 16,
+  BAMBOO_HEIGHT: 40,
+  BAMBOO_GROUND_HEIGHT: 3,   // bottom of ground bamboo above the ground
+  BAMBOO_MID_HEIGHT: 95,     // bottom of "mid-jump" bamboo above the ground
+  BAMBOO_REWARD_HEIGHT: 125, // bottom of the reward stick floating over a rock
+  ROCK_REWARD_CHANCE: 0.55,  // chance a rock gets a reward stick above it
+  BRANCH_REWARD_CHANCE: 0.45,// chance a branch gets a low stick under it (duck to grab)
+  BAMBOO_OBSTACLE_MARGIN: 70,// bamboo patterns keep at least this far from obstacles
+  BAMBOO_PATTERN_SPACING: 36,// distance between sticks in a row
+
+  // --- Collision ---
+  HITBOX_INSET: 0.12,        // hitboxes are 12% smaller than the drawing (6% per side)
+
+  // --- Parallax speed factors (1 = same speed as obstacles) ---
+  PARALLAX_FAR: 0.08,
+  PARALLAX_MOUNTAINS: 0.15,
+  PARALLAX_FOREST: 0.4,
+  PARALLAX_GROUND: 1.0,
+
+  // --- Misc ---
+  RESTART_DELAY: 0.5,        // seconds before Space can restart after win / loss
+  FONT: "'Trebuchet MS', 'Segoe UI', Verdana, sans-serif",
+};
+
+
+/* =====================================================================
+   2. Helpers
+   ===================================================================== */
+
+// Random number between a and b.
+const rand = (a, b) => a + Math.random() * (b - a);
+// Random integer between a and b (both included).
+const randInt = (a, b) => Math.floor(rand(a, b + 1));
+// Random element of an array.
+const choose = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+// A repeatable random number generator. The background uses it so the
+// scenery looks the same every time you load the page.
+function seededRandom(seed) {
+  return function () {
+    seed = (seed * 16807) % 2147483647;
+    return (seed - 1) / 2147483646;
+  };
+}
+
+// Make a hitbox that is HITBOX_INSET smaller than the drawn box, keeping it
+// centred. Smaller hitboxes make near-misses feel fair instead of frustrating.
+function insetBox(x, y, w, h) {
+  const ix = (w * CONFIG.HITBOX_INSET) / 2;
+  const iy = (h * CONFIG.HITBOX_INSET) / 2;
+  return { x: x + ix, y: y + iy, w: w - 2 * ix, h: h - 2 * iy };
+}
+
+// Axis-aligned bounding box (AABB) overlap test: true if rectangles touch.
+function overlaps(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x &&
+         a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+// Draw a filled (and optionally outlined) ellipse.
+function ellipse(ctx, x, y, rx, ry, rotation, fill, stroke, lineWidth) {
+  ctx.beginPath();
+  ctx.ellipse(x, y, rx, ry, rotation || 0, 0, Math.PI * 2);
+  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+  if (stroke) { ctx.lineWidth = lineWidth || 2; ctx.strokeStyle = stroke; ctx.stroke(); }
+}
+
+// Build a rounded-rectangle path (call fill() / stroke() afterwards).
+function roundRectPath(ctx, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+// Draw text with an optional outline, centred by default.
+function drawText(ctx, text, x, y, size, color, options = {}) {
+  ctx.font = `${options.weight || "bold"} ${size}px ${CONFIG.FONT}`;
+  ctx.textAlign = options.align || "center";
+  ctx.textBaseline = "middle";
+  if (options.stroke) {
+    ctx.lineJoin = "round";
+    ctx.lineWidth = options.strokeWidth || 4;
+    ctx.strokeStyle = options.stroke;
+    ctx.strokeText(text, x, y);
+  }
+  ctx.fillStyle = color;
+  ctx.fillText(text, x, y);
+}
+
+// A soft, rounded panel used behind menu text.
+function drawPanel(ctx, x, y, w, h) {
+  ctx.save();
+  ctx.shadowColor = "rgba(0,0,0,0.25)";
+  ctx.shadowBlur = 12;
+  ctx.shadowOffsetY = 4;
+  roundRectPath(ctx, x, y, w, h, 18);
+  ctx.fillStyle = "rgba(255, 253, 240, 0.93)";
+  ctx.fill();
+  ctx.restore();
+  roundRectPath(ctx, x, y, w, h, 18);
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = "#4c8a2e";
+  ctx.stroke();
+}
+
+// Five-pointed star (used for sparkles and dizzy stars).
+function drawStar(ctx, x, y, r, color) {
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const radius = i % 2 === 0 ? r : r * 0.45;
+    const a = -Math.PI / 2 + (i * Math.PI) / 5;
+    ctx.lineTo(x + Math.cos(a) * radius, y + Math.sin(a) * radius);
+  }
+  ctx.closePath();
+  ctx.fillStyle = color;
+  ctx.fill();
+}
+
+// Draw one bamboo stalk. (cx, top) is the top-centre; h is its height.
+// Shared by the collectible sticks and the HUD icon.
+function drawBambooStalk(ctx, cx, top, h) {
+  const sw = h * 0.23; // stalk width
+  // Leaves (drawn first so the stalk sits on top of them)
+  ellipse(ctx, cx + sw * 1.1, top + h * 0.3, sw * 0.95, sw * 0.32, -0.55, "#5fb83a");
+  ellipse(ctx, cx - sw * 1.0, top + h * 0.62, sw * 0.85, sw * 0.3, 0.55, "#4fa52f");
+  // The stalk, with a left-to-right gradient so it looks round
+  const g = ctx.createLinearGradient(cx - sw / 2, 0, cx + sw / 2, 0);
+  g.addColorStop(0, "#a6e07a");
+  g.addColorStop(0.5, "#6fbf45");
+  g.addColorStop(1, "#3f8a24");
+  roundRectPath(ctx, cx - sw / 2, top, sw, h, sw * 0.35);
+  ctx.fillStyle = g;
+  ctx.fill();
+  ctx.lineWidth = 1.2;
+  ctx.strokeStyle = "#2f6b1a";
+  ctx.stroke();
+  // Segment joints ("nodes")
+  ctx.fillStyle = "#2f6b1a";
+  for (const f of [0.33, 0.66]) {
+    roundRectPath(ctx, cx - sw / 2 - 1, top + h * f - 1.3, sw + 2, 2.6, 1.2);
+    ctx.fill();
+  }
+}
+
+
+/* =====================================================================
+   3. Sound - tiny synthesized beeps (no audio files needed)
+   Browsers only allow audio after the user interacts with the page, so
+   the AudioContext is created on the first key press (see unlock()).
+   ===================================================================== */
+class Sound {
+  constructor() {
+    this.ctx = null;
+    this.muted = false;
+  }
+
+  // Called on every key press; creates/resumes audio the first time.
+  unlock() {
+    if (!this.ctx) {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return;
+      try { this.ctx = new AudioCtx(); } catch (e) { return; }
+    }
+    if (this.ctx.state === "suspended") this.ctx.resume();
+  }
+
+  // Play one tone that slides from freq to endFreq and fades out.
+  tone(freq, endFreq, duration, type = "sine", volume = 0.2, delay = 0) {
+    if (!this.ctx || this.muted) return;
+    const t0 = this.ctx.currentTime + delay;
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, t0);
+    if (endFreq !== freq) osc.frequency.exponentialRampToValueAtTime(endFreq, t0 + duration);
+    gain.gain.setValueAtTime(volume, t0);
+    gain.gain.exponentialRampToValueAtTime(0.001, t0 + duration);
+    osc.connect(gain).connect(this.ctx.destination);
+    osc.start(t0);
+    osc.stop(t0 + duration + 0.02);
+  }
+
+  jump()    { this.tone(260, 640, 0.18, "sine", 0.25); }                    // "boing"
+  collect() { this.tone(1320, 1320, 0.08, "triangle", 0.16);                 // "ding"
+              this.tone(1760, 1760, 0.16, "triangle", 0.14, 0.06); }
+  thud()    { this.tone(170, 45, 0.3, "square", 0.14);                       // "thud"
+              this.tone(95, 40, 0.35, "sine", 0.4); }
+  levelUp() { this.tone(660, 990, 0.15, "triangle", 0.12); }
+  win() {                                                                     // jingle
+    const notes = [523, 659, 784, 1047, 784, 1047];
+    notes.forEach((f, i) => this.tone(f, f, i === notes.length - 1 ? 0.45 : 0.14, "triangle", 0.2, i * 0.13));
+  }
+}
+
+
+/* =====================================================================
+   4. Panda - the player
+   (x, y) is the point between his feet. y === GROUND_Y means he is
+   standing on the ground; smaller y means he is in the air.
+   ===================================================================== */
+const PANDA_BLACK = "#1f1f24";
+const PANDA_WHITE = "#fbfbf8";
+
+class Panda {
+  constructor() {
+    this.reset();
+  }
+
+  reset() {
+    this.x = CONFIG.PANDA_X;
+    this.y = CONFIG.GROUND_Y;
+    this.vy = 0;              // vertical speed (negative = going up)
+    this.onGround = true;
+    this.wantsDuck = false;   // is the Down key held?
+    this.jumpBuffer = 0;      // time left on a pending jump request
+    this.animTime = 0;        // drives the running animation
+  }
+
+  // He only counts as ducking while on the ground.
+  get isDucking() {
+    return this.onGround && this.wantsDuck;
+  }
+
+  // Ask for a jump. It happens on the next update if he is on the ground
+  // (or within JUMP_BUFFER_TIME once he lands). No double jumps.
+  requestJump() {
+    this.jumpBuffer = CONFIG.JUMP_BUFFER_TIME;
+  }
+
+  setDuck(held) {
+    this.wantsDuck = held;
+    // Fast-drop: pressing Down while still rising stops the rise right away.
+    if (held && !this.onGround && this.vy < 0) this.vy = 0;
+  }
+
+  // Move the panda forward in time by dt seconds. Returns true if he jumped.
+  update(dt, animSpeed = 1) {
+    let jumped = false;
+    this.animTime += dt * animSpeed;
+
+    if (this.jumpBuffer > 0) {
+      this.jumpBuffer -= dt;
+      if (this.onGround) {
+        this.vy = -CONFIG.JUMP_VELOCITY;
+        this.onGround = false;
+        this.jumpBuffer = 0;
+        jumped = true;
+      }
+    }
+
+    if (!this.onGround) {
+      // Gravity pulls him down; holding Down makes gravity stronger (fast-drop).
+      let g = CONFIG.GRAVITY;
+      if (this.wantsDuck) g *= CONFIG.FAST_DROP_MULTIPLIER;
+      this.vy += g * dt;
+      this.y += this.vy * dt;
+      // Land on the ground
+      if (this.y >= CONFIG.GROUND_Y) {
+        this.y = CONFIG.GROUND_Y;
+        this.vy = 0;
+        this.onGround = true;
+      }
+    }
+    return jumped;
+  }
+
+  // The collision rectangle. It is shorter (and a bit wider) while ducking.
+  getHitbox() {
+    const duck = this.isDucking;
+    const w = duck ? CONFIG.PANDA_DUCK_WIDTH : CONFIG.PANDA_WIDTH;
+    const h = duck ? CONFIG.PANDA_DUCK_HEIGHT : CONFIG.PANDA_HEIGHT;
+    return insetBox(this.x - w / 2, this.y - h, w, h);
+  }
+
+  // Draw the panda. mode is "run", "idle", "dizzy" or "happy".
+  draw(ctx, mode, time) {
+    // Shadow on the ground (smaller when he is high up)
+    const height = CONFIG.GROUND_Y - this.y;
+    const s = Math.max(0.35, 1 - height / 220);
+    ellipse(ctx, this.x, CONFIG.GROUND_Y + 2, 26 * s, 5 * s, 0, "rgba(0,0,0,0.22)");
+
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    if (mode === "idle") {
+      drawPandaIdle(ctx, time);
+    } else if (mode === "dizzy") {
+      drawPandaDizzy(ctx, time);
+    } else if (mode === "happy") {
+      drawPandaHappy(ctx, time);
+    } else if (!this.onGround) {
+      drawPandaJump(ctx);
+    } else if (this.isDucking) {
+      drawPandaDuck(ctx, Math.floor(this.animTime * CONFIG.RUN_ANIM_FPS) % 4);
+    } else {
+      drawPandaRun(ctx, Math.floor(this.animTime * CONFIG.RUN_ANIM_FPS) % 4);
+    }
+    ctx.restore();
+  }
+}
+
+/* ---- Panda drawing functions ----
+   All of these draw with the origin (0,0) between the feet; "up" is
+   negative y. The panda faces right. */
+
+// Head with ears, eye patches, eyes, nose and mouth.
+// eyes: "open" | "blink" | "happy" | "x"   mouth: "smile" | "open" | "wobble"
+function drawPandaHead(ctx, cx, cy, r, eyes = "open", mouth = "smile") {
+  // Ears
+  ellipse(ctx, cx - r * 0.62, cy - r * 0.74, r * 0.36, r * 0.36, 0, PANDA_BLACK);
+  ellipse(ctx, cx + r * 0.62, cy - r * 0.8, r * 0.36, r * 0.36, 0, PANDA_BLACK);
+  // Head
+  ellipse(ctx, cx, cy, r * 1.05, r, 0, PANDA_WHITE, PANDA_BLACK, 2);
+  // Rosy cheeks
+  ellipse(ctx, cx - r * 0.42, cy + r * 0.4, r * 0.17, r * 0.1, 0, "rgba(255,140,160,0.55)");
+  ellipse(ctx, cx + r * 0.85, cy + r * 0.4, r * 0.14, r * 0.1, 0, "rgba(255,140,160,0.55)");
+  // Black eye patches (slightly tilted, like a real panda)
+  const lx = cx - r * 0.05, rx = cx + r * 0.55, ey = cy - r * 0.05;
+  ellipse(ctx, lx, ey, r * 0.25, r * 0.33, 0.45, PANDA_BLACK);
+  ellipse(ctx, rx, ey, r * 0.25, r * 0.33, -0.45, PANDA_BLACK);
+  // Eyes
+  ctx.strokeStyle = "#fff";
+  ctx.lineWidth = 1.8;
+  ctx.lineCap = "round";
+  for (const ex of [lx + 1, rx - 1]) {
+    const eyY = ey - r * 0.04;
+    if (eyes === "open") {
+      ellipse(ctx, ex, eyY, r * 0.12, r * 0.12, 0, "#fff");
+      ellipse(ctx, ex + r * 0.03, eyY, r * 0.075, r * 0.075, 0, "#111");
+      ellipse(ctx, ex + r * 0.06, eyY - r * 0.04, r * 0.03, r * 0.03, 0, "#fff");
+    } else if (eyes === "blink") {
+      ctx.beginPath();
+      ctx.moveTo(ex - r * 0.1, eyY); ctx.lineTo(ex + r * 0.1, eyY);
+      ctx.stroke();
+    } else if (eyes === "happy") {
+      ctx.beginPath();
+      ctx.arc(ex, eyY + r * 0.05, r * 0.1, Math.PI * 1.1, Math.PI * 1.9);
+      ctx.stroke();
+    } else if (eyes === "x") {
+      const d = r * 0.09;
+      ctx.beginPath();
+      ctx.moveTo(ex - d, eyY - d); ctx.lineTo(ex + d, eyY + d);
+      ctx.moveTo(ex + d, eyY - d); ctx.lineTo(ex - d, eyY + d);
+      ctx.stroke();
+    }
+  }
+  // Nose
+  const nx = cx + r * 0.27, ny = cy + r * 0.3;
+  ellipse(ctx, nx, ny, r * 0.13, r * 0.09, 0, PANDA_BLACK);
+  // Mouth
+  ctx.strokeStyle = PANDA_BLACK;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  if (mouth === "open") {
+    ctx.moveTo(nx, ny + r * 0.08);
+    ellipse(ctx, nx, ny + r * 0.25, r * 0.13, r * 0.12, 0, "#e8576e", PANDA_BLACK, 1.5);
+  } else if (mouth === "wobble") {
+    ctx.moveTo(nx - r * 0.2, ny + r * 0.25);
+    ctx.quadraticCurveTo(nx - r * 0.1, ny + r * 0.15, nx, ny + r * 0.25);
+    ctx.quadraticCurveTo(nx + r * 0.1, ny + r * 0.35, nx + r * 0.2, ny + r * 0.25);
+    ctx.stroke();
+  } else {
+    ctx.moveTo(nx, ny + r * 0.08);
+    ctx.lineTo(nx, ny + r * 0.16);
+    ctx.arc(nx - r * 0.09, ny + r * 0.16, r * 0.09, 0, Math.PI);
+    ctx.moveTo(nx, ny + r * 0.16);
+    ctx.arc(nx + r * 0.09, ny + r * 0.16, r * 0.09, Math.PI, 0, true);
+    ctx.stroke();
+  }
+}
+
+// A chunky black leg. lift raises the foot off the ground.
+function drawLeg(ctx, x, lift) {
+  roundRectPath(ctx, x - 7, -19 - lift, 14, 19, 6);
+  ctx.fillStyle = PANDA_BLACK;
+  ctx.fill();
+}
+
+// The round white body plus its little tail.
+function drawBody(ctx, cx, cy, rx, ry) {
+  ellipse(ctx, cx - rx * 0.98, cy - ry * 0.2, 5, 5, 0, PANDA_WHITE, PANDA_BLACK, 1.5); // tail
+  ellipse(ctx, cx, cy, rx, ry, 0, PANDA_WHITE, PANDA_BLACK, 2);
+  // Black shoulder band, typical of pandas
+  ctx.save();
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+  ctx.clip();
+  ellipse(ctx, cx + rx * 0.45, cy - ry * 0.55, rx * 0.5, ry * 0.32, -0.5, PANDA_BLACK);
+  ctx.restore();
+}
+
+// Running: 4 frames of leg / arm swing.
+function drawPandaRun(ctx, frame) {
+  //            backX backLift frontX frontLift
+  const legs = [[-9, 0, 9, 0], [-3, 5, 3, 0], [9, 0, -9, 0], [3, 0, -3, 5]][frame];
+  const armSwing = [0.6, 0, -0.6, 0][frame];
+  const bob = frame % 2 === 1 ? -2 : 0;
+  // Back arm and legs first so the body overlaps them
+  ellipse(ctx, -9, -33 + bob, 6, 12, -armSwing, "#121215");
+  drawLeg(ctx, -2 + legs[0], legs[1]);
+  drawLeg(ctx, -2 + legs[2], legs[3]);
+  drawBody(ctx, -2, -31 + bob, 23, 21);
+  ellipse(ctx, 9, -31 + bob, 6.5, 12, armSwing, PANDA_BLACK); // front arm
+  drawPandaHead(ctx, 9, -52 + bob, 17, "open", "smile");
+}
+
+// Standing still on the title screen: breathing and blinking.
+function drawPandaIdle(ctx, time) {
+  const bob = Math.sin(time * 2.5) * 1.2;
+  const blink = time % 3.2 < 0.13;
+  ellipse(ctx, -9, -33 + bob, 6, 12, 0.15, "#121215");
+  drawLeg(ctx, -10, 0);
+  drawLeg(ctx, 6, 0);
+  drawBody(ctx, -2, -31 + bob, 23, 21);
+  // Front arm waves
+  ellipse(ctx, 13, -40 + bob, 6.5, 12, -1.9 + Math.sin(time * 6) * 0.35, PANDA_BLACK);
+  drawPandaHead(ctx, 9, -52 + bob, 17, blink ? "blink" : "open", "smile");
+}
+
+// Jumping: legs tucked up, arms out.
+function drawPandaJump(ctx) {
+  ellipse(ctx, -16, -44, 6, 12, -0.9, "#121215");     // back arm up
+  ellipse(ctx, -12, -13, 9, 7, 0.3, PANDA_BLACK);      // tucked legs
+  ellipse(ctx, 6, -11, 9, 7, -0.2, PANDA_BLACK);
+  drawBody(ctx, -2, -32, 23, 21);
+  ellipse(ctx, 16, -40, 6.5, 12, 1.0, PANDA_BLACK);    // front arm forward
+  drawPandaHead(ctx, 9, -53, 17, "open", "open");
+}
+
+// Ducking: squashed low body, head tucked down, little legs scurrying.
+function drawPandaDuck(ctx, frame) {
+  const s = frame % 2 === 0 ? 3 : -3;
+  ellipse(ctx, -16 + s, -5, 7, 5, 0, PANDA_BLACK);
+  ellipse(ctx, 8 - s, -5, 7, 5, 0, PANDA_BLACK);
+  drawBody(ctx, -5, -16, 27, 14);
+  ellipse(ctx, 16, -7, 6, 5, 0, PANDA_BLACK);          // front paw
+  drawPandaHead(ctx, 17, -21, 14, "open", "smile");
+}
+
+// Game over: sitting on the ground, tilted back, X eyes, stars spinning.
+function drawPandaDizzy(ctx, time) {
+  ctx.save();
+  ctx.rotate(-0.18);
+  ellipse(ctx, 16, -7, 10, 6.5, -0.3, PANDA_BLACK);    // legs stuck out
+  ellipse(ctx, 2, -5, 10, 6.5, 0.2, PANDA_BLACK);
+  ellipse(ctx, -20, -20, 6, 11, 0.9, "#121215");       // floppy arm
+  drawBody(ctx, -4, -25, 23, 20);
+  ellipse(ctx, 13, -22, 6, 11, -0.7, PANDA_BLACK);
+  drawPandaHead(ctx, 4, -47, 17, "x", "wobble");
+  // Orbiting stars
+  for (let i = 0; i < 3; i++) {
+    const a = time * 4 + (i * Math.PI * 2) / 3;
+    drawStar(ctx, 4 + Math.cos(a) * 24, -70 + Math.sin(a) * 6, 5, "#ffd23f");
+  }
+  ctx.restore();
+}
+
+// Winning: arms up, happy closed eyes, open mouth.
+function drawPandaHappy(ctx, time) {
+  const wave = Math.sin(time * 10) * 0.2;
+  drawLeg(ctx, -10, 2);
+  drawLeg(ctx, 6, 2);
+  ellipse(ctx, -20, -50, 6, 12, -0.5 + wave, "#121215");
+  drawBody(ctx, -2, -31, 23, 21);
+  ellipse(ctx, 22, -52, 6.5, 12, 0.5 - wave, PANDA_BLACK);
+  drawPandaHead(ctx, 9, -52, 17, "happy", "open");
+}
+
+
+/* =====================================================================
+   5. Obstacle - rocks and branches
+   Every obstacle scrolls left at the world speed. Branches have two
+   hitboxes: the leafy part (duck under it) and the trunk above it.
+   ===================================================================== */
+class Obstacle {
+  constructor(kind, x) {
+    this.kind = kind; // "rock" or "branch"
+    this.x = x;
+    if (kind === "rock") {
+      const size = choose(CONFIG.ROCK_SIZES);
+      this.w = size.w;
+      this.h = size.h;
+      this.y = CONFIG.GROUND_Y - this.h;
+      // A lumpy outline: points around a half-ellipse with random wobble
+      this.points = [];
+      const n = 8;
+      for (let i = 0; i <= n; i++) {
+        const a = Math.PI - (Math.PI * i) / n;
+        const r = i === 0 || i === n ? 1 : rand(0.86, 1);
+        this.points.push({
+          x: this.w / 2 + Math.cos(a) * (this.w / 2) * r,
+          y: -Math.sin(a) * this.h * r,
+        });
+      }
+      this.hasMoss = Math.random() < 0.5;
+    } else {
+      this.w = CONFIG.BRANCH_WIDTH;
+      this.bottom = CONFIG.GROUND_Y - CONFIG.BRANCH_CLEARANCE; // lowest leaf
+      this.top = this.bottom - CONFIG.BRANCH_THICKNESS;         // top of leafy part
+      this.trunkW = 22;
+      this.leafSeed = Math.random() * 1000;
+    }
+  }
+
+  get trunkX() {
+    return this.x + this.w - 34;
+  }
+
+  update(dt, speed) {
+    this.x -= speed * dt;
+  }
+
+  get offscreen() {
+    return this.x + this.w < -40;
+  }
+
+  // Returns a list of hitbox rectangles (already inset).
+  getHitboxes() {
+    if (this.kind === "rock") {
+      return [insetBox(this.x, this.y, this.w, this.h)];
+    }
+    return [
+      insetBox(this.x, this.top, this.w, CONFIG.BRANCH_THICKNESS),  // leafy branch
+      insetBox(this.trunkX, 0, this.trunkW, this.top + 12),         // trunk above it
+    ];
+  }
+
+  draw(ctx) {
+    if (this.kind === "rock") this.drawRock(ctx);
+    else this.drawBranch(ctx);
+  }
+
+  drawRock(ctx) {
+    ctx.save();
+    ctx.translate(this.x, CONFIG.GROUND_Y);
+    ctx.beginPath();
+    for (const p of this.points) ctx.lineTo(p.x, p.y);
+    ctx.closePath();
+    const g = ctx.createLinearGradient(0, -this.h, 0, 0);
+    g.addColorStop(0, "#b4b8be");
+    g.addColorStop(1, "#5e646c");
+    ctx.fillStyle = g;
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.lineJoin = "round";
+    ctx.strokeStyle = "#3e4249";
+    ctx.stroke();
+    // Highlight and a crack for detail
+    ellipse(ctx, this.w * 0.35, -this.h * 0.68, this.w * 0.14, this.h * 0.1, -0.4, "rgba(255,255,255,0.45)");
+    ctx.beginPath();
+    ctx.moveTo(this.w * 0.62, -this.h * 0.8);
+    ctx.lineTo(this.w * 0.55, -this.h * 0.5);
+    ctx.lineTo(this.w * 0.64, -this.h * 0.3);
+    ctx.lineWidth = 1.3;
+    ctx.strokeStyle = "rgba(40,40,45,0.6)";
+    ctx.stroke();
+    if (this.hasMoss) {
+      ellipse(ctx, this.w * 0.5, -this.h * 0.93, this.w * 0.18, 3, 0, "#6aa84f");
+    }
+    ctx.restore();
+  }
+
+  drawBranch(ctx) {
+    const x = this.x, w = this.w, top = this.top, bottom = this.bottom;
+    const tx = this.trunkX;
+    const rnd = seededRandom(Math.floor(this.leafSeed) + 1);
+
+    // Tree trunk coming down from the canopy at the top of the screen
+    ctx.fillStyle = "#6b4426";
+    ctx.fillRect(tx, 0, this.trunkW, top + 14);
+    ctx.strokeStyle = "#4a2e17";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(tx, -2, this.trunkW, top + 16);
+    // Bark lines
+    ctx.lineWidth = 1.2;
+    for (let yy = 30; yy < top; yy += 26) {
+      ctx.beginPath();
+      ctx.moveTo(tx + 5, yy);
+      ctx.quadraticCurveTo(tx + 11, yy + 6, tx + 7, yy + 14);
+      ctx.stroke();
+    }
+
+    // Canopy of leaves at the very top
+    for (let i = 0; i < 7; i++) {
+      const cx = x - 20 + (i / 6) * (w + 40);
+      ellipse(ctx, cx, 6 + rnd() * 10, 22 + rnd() * 8, 16 + rnd() * 6, 0, i % 2 ? "#2f6b2a" : "#3c7f33");
+    }
+
+    // The branch itself: a thick, slightly drooping limb from the trunk
+    ctx.beginPath();
+    ctx.moveTo(tx + 8, top + 2);
+    ctx.quadraticCurveTo(x + w * 0.45, top + 6, x + 2, top + 12);
+    ctx.lineTo(x + 4, top + 18);
+    ctx.quadraticCurveTo(x + w * 0.45, top + 16, tx + 8, top + 22);
+    ctx.closePath();
+    ctx.fillStyle = "#7a4e2c";
+    ctx.fill();
+    ctx.strokeStyle = "#4a2e17";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    // Small twig
+    ctx.beginPath();
+    ctx.moveTo(x + w * 0.4, top + 10);
+    ctx.lineTo(x + w * 0.3, top + 1);
+    ctx.lineWidth = 3;
+    ctx.stroke();
+
+    // Leaves hanging down (the lowest point is exactly `bottom`)
+    const leafCount = 6;
+    for (let i = 0; i < leafCount; i++) {
+      const lx = x + 8 + (i / (leafCount - 1)) * (w - 22);
+      const start = top + 14;
+      const len = i % 2 === 0 ? bottom - start : (bottom - start) * 0.75;
+      const tilt = (rnd() - 0.5) * 0.4;
+      ellipse(ctx, lx, start + len / 2, 7, len / 2, tilt, i % 2 ? "#4f9a3a" : "#5cae43", "#2f6b2a", 1.2);
+      // Leaf vein
+      ctx.beginPath();
+      ctx.moveTo(lx, start + 2);
+      ctx.lineTo(lx, start + len - 3);
+      ctx.strokeStyle = "rgba(40,90,30,0.7)";
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+    // A couple of leaves on top of the branch
+    ellipse(ctx, x + w * 0.2, top + 4, 8, 4, -0.4, "#5cae43", "#2f6b2a", 1);
+    ellipse(ctx, x + w * 0.6, top + 2, 8, 4, 0.4, "#4f9a3a", "#2f6b2a", 1);
+  }
+}
+
+
+/* =====================================================================
+   6. Bamboo - the collectibles
+   heightAboveGround is the gap between the ground and the stick's bottom.
+   ===================================================================== */
+class Bamboo {
+  constructor(x, heightAboveGround) {
+    this.w = CONFIG.BAMBOO_WIDTH;
+    this.h = CONFIG.BAMBOO_HEIGHT;
+    this.x = x; // left edge
+    this.y = CONFIG.GROUND_Y - heightAboveGround - this.h; // top edge
+    this.floating = heightAboveGround > 10;
+    this.phase = rand(0, Math.PI * 2);
+  }
+
+  update(dt, speed) {
+    this.x -= speed * dt;
+    this.phase += dt * 3;
+  }
+
+  get offscreen() {
+    return this.x + this.w < -30;
+  }
+
+  // The hitbox does not bob up and down: the bob is only visual.
+  getHitbox() {
+    return insetBox(this.x, this.y, this.w, this.h);
+  }
+
+  draw(ctx) {
+    const bob = this.floating ? Math.sin(this.phase) * 2 : 0;
+    if (this.floating) {
+      // Soft glow so floating sticks stand out
+      ellipse(ctx, this.x + this.w / 2, this.y + this.h / 2 + bob, 16, 24, 0, "rgba(255,255,200,0.25)");
+    }
+    drawBambooStalk(ctx, this.x + this.w / 2, this.y + bob, this.h);
+  }
+}
+
+
+/* =====================================================================
+   7. Background - parallax layers
+   `scroll` counts how many pixels the world has moved. Each layer moves
+   at a fraction of that (its parallax factor). Every layer repeats every
+   800px (the screen width), so it loops without a visible seam.
+   ===================================================================== */
+class Background {
+  constructor() {
+    this.scroll = 0;
+    this.period = CONFIG.WIDTH;
+    const rnd = seededRandom(42);
+
+    // Mountain shapes are sums of sine waves. Each wave has a whole number
+    // of cycles (k) per 800px, so the outline repeats perfectly.
+    this.farWaves = [{ k: 2, a: 38, p: 0.3 }, { k: 3, a: 22, p: 1.7 }, { k: 7, a: 9, p: 0.5 }];
+    this.nearWaves = [{ k: 1, a: 26, p: 2.1 }, { k: 4, a: 20, p: 0.2 }, { k: 9, a: 7, p: 1.1 }];
+
+    // Bamboo forest silhouette: stalks at random positions within one period
+    this.stalks = [];
+    for (let i = 0; i < 34; i++) {
+      this.stalks.push({
+        x: rnd() * this.period,
+        w: 5 + rnd() * 6,
+        top: 120 + rnd() * 110,
+        shade: rnd(),
+        leafSide: rnd() < 0.5 ? -1 : 1,
+      });
+    }
+    this.stalks.sort((a, b) => a.shade - b.shade); // darker ones drawn last (in front)
+
+    // Ground decorations: grass tufts and pebbles
+    this.tufts = [];
+    for (let i = 0; i < 22; i++) this.tufts.push({ x: rnd() * this.period, s: 0.7 + rnd() * 0.6 });
+    this.pebbles = [];
+    for (let i = 0; i < 26; i++) {
+      this.pebbles.push({ x: rnd() * this.period, y: CONFIG.GROUND_Y + 14 + rnd() * 40, r: 1.5 + rnd() * 3 });
+    }
+  }
+
+  update(dt, speed) {
+    this.scroll += speed * dt;
+  }
+
+  // Offset of a layer, always between 0 and period
+  layerOffset(factor) {
+    return (this.scroll * factor) % this.period;
+  }
+
+  // Calls drawFn(screenX) for an item placed at x within the period, twice,
+  // so items leaving on the left reappear on the right with no gap.
+  forEachLooped(x, offset, drawFn) {
+    let sx = (x - offset) % this.period;
+    if (sx < 0) sx += this.period;
+    drawFn(sx);
+    drawFn(sx - this.period);
+  }
+
+  drawMountains(ctx, waves, factor, baseY, color) {
+    const off = this.layerOffset(factor);
+    ctx.beginPath();
+    ctx.moveTo(0, CONFIG.HEIGHT);
+    for (let sx = 0; sx <= CONFIG.WIDTH; sx += 5) {
+      const wx = sx + off;
+      let h = 0;
+      for (const wv of waves) h += wv.a * (0.5 + 0.5 * Math.sin((Math.PI * 2 * wv.k * wx) / this.period + wv.p));
+      ctx.lineTo(sx, baseY - h);
+    }
+    ctx.lineTo(CONFIG.WIDTH, CONFIG.HEIGHT);
+    ctx.closePath();
+    ctx.fillStyle = color;
+    ctx.fill();
+  }
+
+  draw(ctx) {
+    const W = CONFIG.WIDTH, H = CONFIG.HEIGHT, GY = CONFIG.GROUND_Y;
+
+    // --- Layer 1 (far, slowest): sky, sun and misty mountains ---
+    const sky = ctx.createLinearGradient(0, 0, 0, GY);
+    sky.addColorStop(0, "#7cc6f2");
+    sky.addColorStop(0.6, "#cdeefc");
+    sky.addColorStop(1, "#f4f1d8");
+    ctx.fillStyle = sky;
+    ctx.fillRect(0, 0, W, H);
+    ellipse(ctx, 640, 75, 46, 46, 0, "rgba(255,250,220,0.5)");
+    ellipse(ctx, 640, 75, 32, 32, 0, "#fff6c9");
+
+    this.drawMountains(ctx, this.farWaves, CONFIG.PARALLAX_FAR, 240, "#b4cbdc");
+    this.drawMountains(ctx, this.nearWaves, CONFIG.PARALLAX_MOUNTAINS, 275, "#93b6ad");
+    // Mist band
+    const mist = ctx.createLinearGradient(0, 200, 0, 300);
+    mist.addColorStop(0, "rgba(255,255,255,0)");
+    mist.addColorStop(1, "rgba(255,255,255,0.55)");
+    ctx.fillStyle = mist;
+    ctx.fillRect(0, 200, W, 100);
+
+    // --- Layer 2 (middle): bamboo forest silhouette ---
+    const fOff = this.layerOffset(CONFIG.PARALLAX_FOREST);
+    ctx.globalAlpha = 0.6; // faded so it reads as "far away" and the bamboo pickups stand out
+    for (const s of this.stalks) {
+      const light = Math.floor(95 + s.shade * 40);
+      const color = `rgb(${light - 50}, ${light + 25}, ${light - 30})`;
+      this.forEachLooped(s.x, fOff, (sx) => {
+        if (sx < -40 || sx > W + 40) return;
+        ctx.fillStyle = color;
+        ctx.fillRect(sx, s.top, s.w, GY - s.top);
+        // Joints
+        ctx.fillStyle = "rgba(0,0,0,0.15)";
+        for (let y = s.top + 18; y < GY; y += 24) ctx.fillRect(sx - 1, y, s.w + 2, 2);
+        // Leaves
+        ellipse(ctx, sx + s.w / 2 + s.leafSide * 12, s.top + 8, 14, 4, s.leafSide * -0.5, color);
+        ellipse(ctx, sx + s.w / 2 - s.leafSide * 10, s.top + 30, 12, 3.5, s.leafSide * 0.5, color);
+      });
+    }
+    ctx.globalAlpha = 1;
+
+    // --- Layer 3 (near): ground strip, same speed as obstacles ---
+    const ground = ctx.createLinearGradient(0, GY, 0, H);
+    ground.addColorStop(0, "#7cc04f");
+    ground.addColorStop(0.18, "#5f9c3a");
+    ground.addColorStop(0.2, "#9b7650");
+    ground.addColorStop(1, "#6e5136");
+    ctx.fillStyle = ground;
+    ctx.fillRect(0, GY, W, H - GY);
+    ctx.fillStyle = "#4f8a2c";
+    ctx.fillRect(0, GY, W, 3);
+
+    const gOff = this.layerOffset(CONFIG.PARALLAX_GROUND);
+    for (const p of this.pebbles) {
+      this.forEachLooped(p.x, gOff, (sx) => {
+        ellipse(ctx, sx, p.y, p.r * 1.3, p.r, 0, "#857055");
+        ellipse(ctx, sx - p.r * 0.3, p.y - p.r * 0.3, p.r * 0.4, p.r * 0.3, 0, "rgba(255,255,255,0.25)");
+      });
+    }
+    ctx.strokeStyle = "#3f7d22";
+    ctx.lineWidth = 2;
+    ctx.lineCap = "round";
+    for (const t of this.tufts) {
+      this.forEachLooped(t.x, gOff, (sx) => {
+        ctx.beginPath();
+        for (let i = -1; i <= 1; i++) {
+          ctx.moveTo(sx + i * 3, GY + 2);
+          ctx.lineTo(sx + i * 5 * t.s, GY - 8 * t.s - (i === 0 ? 3 : 0));
+        }
+        ctx.stroke();
+      });
+    }
+  }
+}
+
+
+/* =====================================================================
+   8. Game - ties everything together
+   States: "title" -> "playing" <-> "paused"
+                      "playing" -> "gameover" | "win" -> "playing"
+   ===================================================================== */
+class Game {
+  constructor(sound) {
+    this.sound = sound;
+    this.panda = new Panda();
+    this.background = new Background();
+    this.state = "title";
+    this.debug = false;     // H toggles hitbox outlines
+    this.bestScore = 0;     // best bamboo count this session
+    this.time = 0;          // total time, used for animations
+    this.keys = new Set();  // keys currently held down
+    this.fps = 60;
+    this.resetRun();
+  }
+
+  // Clear everything for a fresh run.
+  resetRun() {
+    this.count = 0;              // bamboo collected this run
+    this.obstacles = [];
+    this.bamboos = [];
+    this.particles = [];         // "+1" pops and sparkles
+    this.confetti = [];
+    this.hitBy = null;           // "rock" or "branch" after a crash
+    this.endTime = 0;            // when the run ended
+    this.panda.reset();
+    // Distance (px) still to scroll before the next obstacle appears
+    this.distToNextObstacle = CONFIG.START_SPEED * CONFIG.FIRST_OBSTACLE_DELAY;
+    this.nextObstacleKind = this.pickObstacleKind();
+  }
+
+  // Current scroll speed: a small bump every SPEED_STEP_EVERY bamboo.
+  get speedLevel() {
+    return Math.floor(this.count / CONFIG.SPEED_STEP_EVERY);
+  }
+  get speed() {
+    return Math.min(CONFIG.MAX_SPEED, CONFIG.START_SPEED + this.speedLevel * CONFIG.SPEED_STEP);
+  }
+
+  pickObstacleKind() {
+    return Math.random() < CONFIG.BRANCH_CHANCE ? "branch" : "rock";
+  }
+
+  /* ------------------------- State changes ------------------------- */
+
+  start() {
+    this.resetRun();
+    this.state = "playing";
+    this.panda.setDuck(this.keys.has("ArrowDown"));
+    // Bamboo in the stretch before the first obstacle, so there is
+    // something to grab right away.
+    const firstObstacleX = CONFIG.WIDTH + 20 + this.distToNextObstacle;
+    this.placeBambooPatterns(CONFIG.WIDTH - 200, firstObstacleX);
+  }
+
+  pause() {
+    if (this.state === "playing") this.state = "paused";
+  }
+
+  resume() {
+    if (this.state === "paused") {
+      this.state = "playing";
+      this.panda.setDuck(this.keys.has("ArrowDown"));
+    }
+  }
+
+  gameOver(kind) {
+    this.state = "gameover";
+    this.hitBy = kind;
+    this.endTime = this.time;
+    this.bestScore = Math.max(this.bestScore, this.count);
+    this.panda.wantsDuck = false;
+    this.panda.vy = Math.max(this.panda.vy, 0); // stop rising, fall to the ground
+    this.sound.thud();
+  }
+
+  win() {
+    this.state = "win";
+    this.endTime = this.time;
+    this.bestScore = Math.max(this.bestScore, this.count);
+    this.sound.win();
+    // Confetti and falling bamboo leaves
+    const colors = ["#ff6b6b", "#ffd93d", "#6bcB77", "#4d96ff", "#ff9ff3", "#ffffff"];
+    for (let i = 0; i < 160; i++) {
+      this.confetti.push({
+        x: rand(0, CONFIG.WIDTH),
+        y: rand(-CONFIG.HEIGHT, 0),
+        vx: rand(-30, 30),
+        vy: rand(60, 150),
+        rot: rand(0, Math.PI * 2),
+        vr: rand(-6, 6),
+        leaf: i % 3 === 0,
+        color: choose(colors),
+      });
+    }
+  }
+
+  /* ---------------------------- Input ------------------------------ */
+
+  onKeyDown(e) {
+    const key = e.key;
+    const isStartKey = key === " " || key === "Spacebar" || e.code === "Space" || key === "Enter";
+    if (!e.repeat) this.keys.add(key);
+
+    if (key === "h" || key === "H") { this.debug = !this.debug; return; }
+    if (key === "m" || key === "M") { this.sound.muted = !this.sound.muted; return; }
+
+    switch (this.state) {
+      case "title":
+        if (isStartKey) this.start();
+        break;
+      case "playing":
+        if (key === "ArrowUp" && !e.repeat) this.panda.requestJump();
+        if (key === "ArrowDown") this.panda.setDuck(true);
+        if (key === "p" || key === "P" || key === "Escape") this.pause();
+        break;
+      case "paused":
+        if (key === "p" || key === "P" || key === "Escape" || isStartKey) this.resume();
+        break;
+      case "gameover":
+      case "win":
+        if (isStartKey && this.time - this.endTime > CONFIG.RESTART_DELAY) this.start();
+        break;
+    }
+  }
+
+  onKeyUp(e) {
+    this.keys.delete(e.key);
+    if (e.key === "ArrowDown") this.panda.setDuck(false);
+  }
+
+  // Called when the tab/window loses focus.
+  onBlur() {
+    this.keys.clear();
+    this.panda.setDuck(false);
+    this.pause();
+  }
+
+  /* --------------------------- Spawning ---------------------------- */
+
+  spawnObstacle() {
+    // Spawn just off the right edge. distToNextObstacle is <= 0 here; adding
+    // it keeps spacing exact even if we overshot a little this frame.
+    const x = CONFIG.WIDTH + 20 + this.distToNextObstacle;
+    const kind = this.nextObstacleKind;
+    const obs = new Obstacle(kind, x);
+    this.obstacles.push(obs);
+
+    // Decide what comes next and how far away it is.
+    const next = this.pickObstacleKind();
+    this.nextObstacleKind = next;
+    const randomPart = Math.max(CONFIG.RANDOM_GAP_MIN, CONFIG.RANDOM_GAP - this.speedLevel * CONFIG.RANDOM_GAP_SHRINK);
+    let gapTime = CONFIG.MIN_OBSTACLE_GAP + rand(0, randomPart);
+    if (next !== kind) gapTime += CONFIG.MIXED_GAP_BONUS; // rock<->branch needs a bit more time
+    // Convert time to pixels. We use the speed one step faster than now, in
+    // case the player speeds up before reaching the next obstacle; that way
+    // the minimum gap in seconds is still respected.
+    const safeSpeed = Math.min(CONFIG.MAX_SPEED, this.speed + CONFIG.SPEED_STEP);
+    const gapPx = obs.w + gapTime * safeSpeed;
+    this.distToNextObstacle += gapPx;
+    const nextObstacleX = obs.x + gapPx;
+
+    // Optional reward bamboo tied to this obstacle
+    const bw = CONFIG.BAMBOO_WIDTH;
+    if (kind === "rock" && Math.random() < CONFIG.ROCK_REWARD_CHANCE) {
+      // Floating above the rock: grabbed by jumping over it
+      this.bamboos.push(new Bamboo(obs.x + obs.w / 2 - bw / 2, CONFIG.BAMBOO_REWARD_HEIGHT));
+    } else if (kind === "branch" && Math.random() < CONFIG.BRANCH_REWARD_CHANCE) {
+      // Low stick under the leaves: grabbed by ducking (fits below the leaves)
+      this.bamboos.push(new Bamboo(obs.x + obs.w * 0.35, CONFIG.BAMBOO_GROUND_HEIGHT));
+    }
+
+    // Bamboo patterns in the empty stretch between this obstacle and the next
+    this.placeBambooPatterns(obs.x + obs.w, nextObstacleX);
+  }
+
+  // Fill the free space between two x positions with bamboo patterns,
+  // keeping a margin from obstacles at both ends.
+  placeBambooPatterns(startX, endX) {
+    const speed = this.speed;
+    const margin = CONFIG.BAMBOO_OBSTACLE_MARGIN;
+    const airTime = (2 * CONFIG.JUMP_VELOCITY) / CONFIG.GRAVITY;
+    const peak = (CONFIG.JUMP_VELOCITY * CONFIG.JUMP_VELOCITY) / (2 * CONFIG.GRAVITY);
+    let cursor = startX + margin;
+
+    for (let tries = 0; tries < 4; tries++) {
+      const pattern = this.makePattern(speed, airTime, peak);
+      // Patterns that need a jump get extra room so the player can take off
+      // after the previous obstacle and land before the next one.
+      const before = pattern.needsJump ? speed * 0.25 : 0;
+      const after = pattern.needsJump ? speed * 0.35 : 0;
+      const left = cursor + before;
+      if (left + pattern.width + after > endX - margin) {
+        if (pattern.width > CONFIG.BAMBOO_WIDTH) continue; // try a smaller pattern
+        break;
+      }
+      for (const stick of pattern.sticks) this.bamboos.push(new Bamboo(left + stick.dx, stick.h));
+      cursor = left + pattern.width + after + rand(60, 160);
+      if (Math.random() < 0.35) break; // leave some stretches emptier
+    }
+  }
+
+  // Build a random bamboo pattern. Returns { sticks: [{dx, h}], width, needsJump }.
+  makePattern(speed, airTime, peak) {
+    const GH = CONFIG.BAMBOO_GROUND_HEIGHT, MH = CONFIG.BAMBOO_MID_HEIGHT;
+    const sp = CONFIG.BAMBOO_PATTERN_SPACING, bw = CONFIG.BAMBOO_WIDTH;
+    const r = Math.random();
+    const sticks = [];
+    let needsJump = false;
+
+    if (r < 0.25) {
+      sticks.push({ dx: 0, h: GH });                              // single, on the ground
+    } else if (r < 0.42) {
+      sticks.push({ dx: 0, h: MH }); needsJump = true;            // single, mid-jump height
+    } else if (r < 0.7) {
+      const n = randInt(3, 5);                                    // ground row of 3-5
+      for (let i = 0; i < n; i++) sticks.push({ dx: i * sp, h: GH });
+    } else if (r < 0.8) {
+      for (let i = 0; i < 3; i++) sticks.push({ dx: i * sp, h: MH }); // floating row of 3
+      needsJump = true;
+    } else {
+      // Arc of 3-5 that follows the panda's real jump curve, so a single
+      // well-timed jump collects them all.
+      const n = randInt(3, 5);
+      const range = speed * airTime; // horizontal distance covered during a jump
+      for (let i = 0; i < n; i++) {
+        const u = 0.15 + (0.7 * i) / (n - 1);          // fraction of the jump
+        const pandaBottom = peak * 4 * u * (1 - u);    // panda's feet height then
+        sticks.push({ dx: (u - 0.15) * range, h: pandaBottom + 14 });
+      }
+      needsJump = true;
+    }
+    const width = sticks[sticks.length - 1].dx + bw;
+    return { sticks, width, needsJump };
+  }
+
+  /* ---------------------------- Update ----------------------------- */
+
+  update(dt) {
+    this.time += dt;
+    switch (this.state) {
+      case "title":
+        this.background.update(dt, CONFIG.TITLE_SCROLL_SPEED);
+        break;
+      case "playing":
+        this.updatePlaying(dt);
+        break;
+      case "gameover":
+        this.panda.update(dt); // finish falling to the ground
+        this.updateParticles(dt);
+        break;
+      case "win":
+        this.updateParticles(dt);
+        this.updateConfetti(dt);
+        break;
+      // "paused": nothing moves
+    }
+  }
+
+  updatePlaying(dt) {
+    const speed = this.speed;
+    this.background.update(dt, speed * CONFIG.PARALLAX_GROUND);
+
+    // Panda physics (legs animate faster when the world is faster)
+    if (this.panda.update(dt, speed / CONFIG.START_SPEED)) this.sound.jump();
+
+    // Move obstacles and bamboo, drop the ones that left the screen
+    for (const o of this.obstacles) o.update(dt, speed);
+    for (const b of this.bamboos) b.update(dt, speed);
+    this.obstacles = this.obstacles.filter((o) => !o.offscreen);
+    this.bamboos = this.bamboos.filter((b) => !b.offscreen);
+
+    // Spawn the next obstacle when enough distance has scrolled by
+    this.distToNextObstacle -= speed * dt;
+    if (this.distToNextObstacle <= 0) this.spawnObstacle();
+
+    // --- Collisions ---
+    const pandaBox = this.panda.getHitbox();
+
+    // Bamboo first: grabbing the 50th stick wins immediately.
+    for (let i = this.bamboos.length - 1; i >= 0; i--) {
+      const b = this.bamboos[i];
+      if (overlaps(pandaBox, b.getHitbox())) {
+        this.bamboos.splice(i, 1);
+        this.collect(b);
+        if (this.state !== "playing") return; // we just won
+      }
+    }
+
+    // Any obstacle touch ends the run.
+    for (const o of this.obstacles) {
+      for (const box of o.getHitboxes()) {
+        if (overlaps(pandaBox, box)) {
+          this.gameOver(o.kind);
+          return;
+        }
+      }
+    }
+
+    this.updateParticles(dt);
+  }
+
+  collect(b) {
+    this.count++;
+    this.sound.collect();
+    const cx = b.x + b.w / 2, cy = b.y;
+    this.particles.push({ type: "text", text: "+1", x: cx, y: cy, vy: -60, life: 0.8, max: 0.8 });
+    for (let i = 0; i < 7; i++) {
+      const a = rand(0, Math.PI * 2);
+      this.particles.push({
+        type: "spark", x: cx, y: cy + b.h / 2,
+        vx: Math.cos(a) * rand(60, 140), vy: Math.sin(a) * rand(60, 140),
+        life: 0.5, max: 0.5, color: choose(["#ffe066", "#b6f07a", "#ffffff"]),
+      });
+    }
+    if (this.count >= CONFIG.WIN_TARGET) {
+      this.win();
+    } else if (this.count % CONFIG.SPEED_STEP_EVERY === 0 &&
+               CONFIG.START_SPEED + this.speedLevel * CONFIG.SPEED_STEP <= CONFIG.MAX_SPEED) {
+      this.sound.levelUp();
+      this.particles.push({ type: "banner", text: "Faster!", x: CONFIG.WIDTH / 2, y: 120, vy: -15, life: 1.3, max: 1.3 });
+    }
+  }
+
+  updateParticles(dt) {
+    for (const p of this.particles) {
+      p.life -= dt;
+      p.y += p.vy * dt;
+      if (p.vx) p.x += p.vx * dt;
+    }
+    this.particles = this.particles.filter((p) => p.life > 0);
+  }
+
+  updateConfetti(dt) {
+    for (const c of this.confetti) {
+      c.x += (c.vx + Math.sin(this.time * 2 + c.rot) * 20) * dt;
+      c.y += c.vy * dt;
+      c.rot += c.vr * dt;
+      if (c.y > CONFIG.HEIGHT + 10) { c.y = -10; c.x = rand(0, CONFIG.WIDTH); }
+    }
+  }
+
+  /* ---------------------------- Drawing ---------------------------- */
+
+  draw(ctx) {
+    this.background.draw(ctx);
+    for (const b of this.bamboos) b.draw(ctx);
+    for (const o of this.obstacles) o.draw(ctx);
+
+    // Panda pose depends on the game state
+    let mode = "run";
+    if (this.state === "title") mode = "idle";
+    else if (this.state === "gameover" && this.panda.onGround) mode = "dizzy";
+    else if (this.state === "win") mode = "happy";
+    if (this.state === "win") {
+      // Happy hopping
+      this.panda.y = CONFIG.GROUND_Y - Math.abs(Math.sin((this.time - this.endTime) * 6)) * 28;
+    }
+    this.panda.draw(ctx, mode, this.time);
+
+    this.drawParticles(ctx);
+    if (this.state === "win") this.drawConfetti(ctx);
+    if (this.state !== "title") this.drawHUD(ctx);
+
+    if (this.state === "title") this.drawTitle(ctx);
+    else if (this.state === "paused") this.drawPaused(ctx);
+    else if (this.state === "gameover") this.drawGameOver(ctx);
+    else if (this.state === "win") this.drawWin(ctx);
+
+    if (this.debug) this.drawDebug(ctx);
+  }
+
+  drawParticles(ctx) {
+    for (const p of this.particles) {
+      const alpha = Math.max(0, p.life / p.max);
+      ctx.globalAlpha = alpha;
+      if (p.type === "text") {
+        drawText(ctx, p.text, p.x, p.y, 20, "#fff4a3", { stroke: "#3f7d22", strokeWidth: 4 });
+      } else if (p.type === "banner") {
+        drawText(ctx, p.text, p.x, p.y, 36, "#ffffff", { stroke: "#d35400", strokeWidth: 6 });
+      } else {
+        drawStar(ctx, p.x, p.y, 4, p.color);
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  drawConfetti(ctx) {
+    for (const c of this.confetti) {
+      ctx.save();
+      ctx.translate(c.x, c.y);
+      ctx.rotate(c.rot);
+      if (c.leaf) {
+        ellipse(ctx, 0, 0, 9, 3.5, 0, "#5cae43", "#2f6b1a", 1);
+      } else {
+        ctx.fillStyle = c.color;
+        ctx.fillRect(-4, -2.5, 8, 5);
+      }
+      ctx.restore();
+    }
+  }
+
+  drawHUD(ctx) {
+    // Panel in the top-left corner
+    ctx.save();
+    roundRectPath(ctx, 12, 10, 200, 58, 12);
+    ctx.fillStyle = "rgba(255,255,255,0.8)";
+    ctx.fill();
+    ctx.restore();
+    drawBambooStalk(ctx, 34, 16, 40);
+    drawText(ctx, `${this.count} / ${CONFIG.WIN_TARGET}`, 58, 30, 24, "#2f5d1a", { align: "left" });
+
+    // Progress bar toward the goal
+    const bx = 58, by = 46, bw = 140, bh = 12;
+    roundRectPath(ctx, bx, by, bw, bh, 6);
+    ctx.fillStyle = "#dfe8d4";
+    ctx.fill();
+    const frac = Math.min(1, this.count / CONFIG.WIN_TARGET);
+    if (frac > 0) {
+      roundRectPath(ctx, bx, by, Math.max(bh, bw * frac), bh, 6);
+      ctx.fillStyle = "#5fb83a";
+      ctx.fill();
+    }
+    roundRectPath(ctx, bx, by, bw, bh, 6);
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = "#3f7d22";
+    ctx.stroke();
+
+    // Small help text in the top-right corner
+    const soundLabel = this.sound.muted ? "M: sound off" : "M: sound on";
+    drawText(ctx, `P: pause   ${soundLabel}   H: hitboxes`, CONFIG.WIDTH - 14, 20, 12,
+      "rgba(30,60,30,0.75)", { align: "right" });
+  }
+
+  drawTitle(ctx) {
+    drawText(ctx, "Bamboo Run", 520, 72, 64, "#ffffff", { stroke: "#2f6b1a", strokeWidth: 10 });
+    drawBambooStalk(ctx, 318, 48, 46);
+    drawBambooStalk(ctx, 722, 48, 46);
+    drawPanel(ctx, 320, 120, 400, 170);
+    drawText(ctx, "↑ Jump,  ↓ Duck,  collect 50 bamboo!", 520, 152, 20, "#2f5d1a");
+    drawText(ctx, "Jump over rocks  •  Duck under branches", 520, 184, 15, "#555");
+    drawText(ctx, "Hold ↓ in the air to drop faster", 520, 206, 15, "#555");
+    drawText(ctx, "P / Esc pause  •  M mute  •  H hitboxes", 520, 228, 13, "#777");
+    if (Math.floor(this.time * 2) % 2 === 0) {
+      drawText(ctx, "Press Space to Start", 520, 264, 24, "#d35400");
+    }
+  }
+
+  drawPaused(ctx) {
+    ctx.fillStyle = "rgba(0,0,0,0.35)";
+    ctx.fillRect(0, 0, CONFIG.WIDTH, CONFIG.HEIGHT);
+    drawPanel(ctx, 250, 130, 300, 110);
+    drawText(ctx, "Paused", 400, 168, 36, "#2f5d1a");
+    drawText(ctx, "Press P to resume", 400, 210, 18, "#555");
+  }
+
+  drawGameOver(ctx) {
+    drawPanel(ctx, 190, 70, 420, 180);
+    drawText(ctx, `Oops! The panda bonked into a ${this.hitBy}!`, 400, 105, 22, "#c0392b");
+    drawText(ctx, `Bamboo this run: ${this.count}`, 400, 145, 20, "#2f5d1a");
+    drawText(ctx, `Best this session: ${this.bestScore}`, 400, 175, 18, "#555");
+    if (this.time - this.endTime > CONFIG.RESTART_DELAY && Math.floor(this.time * 2) % 2 === 0) {
+      drawText(ctx, "Press Space to try again", 400, 220, 20, "#d35400");
+    }
+  }
+
+  drawWin(ctx) {
+    drawPanel(ctx, 190, 70, 420, 170);
+    drawText(ctx, "🎉", 400, 100, 26, "#000");
+    drawText(ctx, `You collected ${CONFIG.WIN_TARGET} bamboo! You win!`, 400, 140, 22, "#2f7d1a");
+    drawText(ctx, `Best this session: ${this.bestScore}`, 400, 172, 17, "#555");
+    if (this.time - this.endTime > CONFIG.RESTART_DELAY && Math.floor(this.time * 2) % 2 === 0) {
+      drawText(ctx, "Press Space to play again", 400, 210, 20, "#d35400");
+    }
+  }
+
+  // Hitbox outlines (press H)
+  drawDebug(ctx) {
+    ctx.lineWidth = 1.5;
+    const outline = (b, color) => { ctx.strokeStyle = color; ctx.strokeRect(b.x, b.y, b.w, b.h); };
+    outline(this.panda.getHitbox(), "#00c853");
+    for (const o of this.obstacles) for (const b of o.getHitboxes()) outline(b, "#ff1744");
+    for (const b of this.bamboos) outline(b.getHitbox(), "#ffab00");
+    drawText(ctx, `DEBUG  speed ${Math.round(this.speed)} px/s  fps ${Math.round(this.fps)}`,
+      CONFIG.WIDTH - 14, 40, 12, "#b00020", { align: "right" });
+  }
+}
+
+
+/* =====================================================================
+   Self-check: verify with plain math that the level design is fair.
+   Results are printed in the browser console (F12).
+   ===================================================================== */
+function runSelfChecks() {
+  const C = CONFIG;
+  const results = [];
+  const peak = (C.JUMP_VELOCITY ** 2) / (2 * C.GRAVITY);
+  const standing = insetBox(0, C.GROUND_Y - C.PANDA_HEIGHT, C.PANDA_WIDTH, C.PANDA_HEIGHT);
+  const ducking = insetBox(0, C.GROUND_Y - C.PANDA_DUCK_HEIGHT, C.PANDA_DUCK_WIDTH, C.PANDA_DUCK_HEIGHT);
+  const feetInset = C.GROUND_Y - (standing.y + standing.h); // hitbox bottom sits this far above the feet
+
+  // Rocks: how long is the panda high enough, vs. how long he needs to be?
+  for (const s of C.ROCK_SIZES) {
+    const rock = insetBox(0, C.GROUND_Y - s.h, s.w, s.h);
+    const needH = C.GROUND_Y - rock.y - feetInset; // feet height needed to clear the rock
+    const timeAbove = needH <= 0 ? Infinity : (2 * Math.sqrt(C.JUMP_VELOCITY ** 2 - 2 * C.GRAVITY * needH)) / C.GRAVITY;
+    const timeNeeded = (standing.w + rock.w) / C.MAX_SPEED;
+    results.push({ check: `rock ${s.w}x${s.h} is jumpable`, ok: needH < peak && timeAbove > timeNeeded,
+      detail: `airborne-above ${timeAbove.toFixed(2)}s, need ${timeNeeded.toFixed(2)}s` });
+  }
+
+  // Branches: hit while standing, clear while ducking
+  const leafBox = insetBox(0, C.GROUND_Y - C.BRANCH_CLEARANCE - C.BRANCH_THICKNESS, C.BRANCH_WIDTH, C.BRANCH_THICKNESS);
+  const leafBottom = leafBox.y + leafBox.h;
+  results.push({ check: "standing panda hits branch", ok: standing.y < leafBottom,
+    detail: `panda top ${standing.y.toFixed(1)} < leaves ${leafBottom.toFixed(1)}` });
+  results.push({ check: "ducking panda clears branch", ok: ducking.y >= leafBottom,
+    detail: `panda top ${ducking.y.toFixed(1)} >= leaves ${leafBottom.toFixed(1)}` });
+
+  // Low bamboo under a branch must not touch the leaves
+  const lowBamboo = insetBox(0, C.GROUND_Y - C.BAMBOO_GROUND_HEIGHT - C.BAMBOO_HEIGHT, C.BAMBOO_WIDTH, C.BAMBOO_HEIGHT);
+  results.push({ check: "under-branch bamboo is clear of leaves", ok: lowBamboo.y > leafBottom,
+    detail: `bamboo top ${lowBamboo.y.toFixed(1)} > leaves ${leafBottom.toFixed(1)}` });
+
+  // Minimum gap leaves time to land from a jump before the next obstacle
+  const airTime = (2 * C.JUMP_VELOCITY) / C.GRAVITY;
+  results.push({ check: "minimum gap > jump air time", ok: C.MIN_OBSTACLE_GAP > airTime,
+    detail: `gap ${C.MIN_OBSTACLE_GAP}s vs air time ${airTime.toFixed(2)}s` });
+
+  const allOk = results.every((r) => r.ok);
+  if (typeof console !== "undefined") {
+    (allOk ? console.log : console.warn)(`Bamboo Run self-checks: ${allOk ? "all passed" : "SOME FAILED"}`);
+    if (console.table) console.table(results);
+  }
+  return { allOk, results };
+}
+
+
+/* =====================================================================
+   9. Startup: canvas scaling, input and the main loop
+   ===================================================================== */
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const sound = new Sound();
+const game = new Game(sound);
+window.bambooRun = { game, CONFIG, runSelfChecks }; // handy for tinkering in the console
+
+// Scale the 800x400 game to fit the window while keeping its shape.
+// The canvas backing store also accounts for high-DPI screens so it stays sharp.
+function resize() {
+  const scale = Math.min(window.innerWidth / CONFIG.WIDTH, window.innerHeight / CONFIG.HEIGHT);
+  const cssW = Math.floor(CONFIG.WIDTH * scale);
+  const cssH = Math.floor(CONFIG.HEIGHT * scale);
+  const dpr = window.devicePixelRatio || 1;
+  canvas.style.width = cssW + "px";
+  canvas.style.height = cssH + "px";
+  canvas.width = Math.max(1, Math.round(cssW * dpr));
+  canvas.height = Math.max(1, Math.round(cssH * dpr));
+}
+window.addEventListener("resize", resize);
+resize();
+
+// Keyboard
+const BLOCKED_KEYS = ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " ", "Spacebar"];
+window.addEventListener("keydown", (e) => {
+  if (BLOCKED_KEYS.includes(e.key) || e.code === "Space") e.preventDefault(); // stop page scrolling
+  sound.unlock(); // audio may only start after a user gesture
+  game.onKeyDown(e);
+});
+window.addEventListener("keyup", (e) => game.onKeyUp(e));
+
+// Auto-pause when the tab or window loses focus
+window.addEventListener("blur", () => game.onBlur());
+document.addEventListener("visibilitychange", () => { if (document.hidden) game.onBlur(); });
+
+// Main loop. Movement uses delta time (seconds since the last frame), so the
+// game runs at the same speed on 60Hz, 120Hz or 144Hz screens. Long frames are
+// split into small steps so fast objects never skip through each other.
+const MAX_FRAME_TIME = 0.1;   // ignore huge gaps (e.g. after switching tabs)
+const STEP = 1 / 120;         // largest physics step
+let lastTime = null;
+
+function frame(now) {
+  if (lastTime === null) lastTime = now;
+  let dt = Math.min(MAX_FRAME_TIME, (now - lastTime) / 1000);
+  lastTime = now;
+  if (dt > 0) game.fps = game.fps * 0.95 + (1 / dt) * 0.05;
+
+  while (dt > 0) {
+    const step = Math.min(STEP, dt);
+    game.update(step);
+    dt -= step;
+  }
+
+  // Draw in 800x400 "game units", scaled to the real canvas size
+  ctx.setTransform(canvas.width / CONFIG.WIDTH, 0, 0, canvas.height / CONFIG.HEIGHT, 0, 0);
+  game.draw(ctx);
+  requestAnimationFrame(frame);
+}
+
+runSelfChecks();
+canvas.focus();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
