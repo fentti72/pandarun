@@ -115,6 +115,20 @@ const CONFIG = {
   // --- Collision ---
   HITBOX_INSET: 0.12,        // hitboxes are 12% smaller than the drawing (6% per side)
 
+  // --- Lives ---
+  START_LIVES: 2,            // hearts at the start of each game
+  INVINCIBLE_TIME: 2.0,      // seconds of invincibility after losing a heart
+  INVINCIBLE_FLASH_HZ: 8,    // how many times per second the panda blinks while invincible
+  HEART_BREAK_TIME: 0.6,     // length of the "heart breaks" animation (seconds)
+
+  // --- Music ---
+  MUSIC_VOLUME: 0.35,        // music loudness (sound effects are at 1.0)
+  MUSIC_BPM: 152,            // tempo of the background tune
+  MUSIC_DUCK_AMOUNT: 0.2,    // music drops to this fraction while "ouch" plays
+  MUSIC_DUCK_TIME: 0.5,      // ...for this many seconds
+  MUSIC_LOOKAHEAD_MS: 25,    // how often the scheduler wakes up (milliseconds)
+  MUSIC_SCHEDULE_AHEAD: 0.12,// how far ahead notes are scheduled on the audio clock (seconds)
+
   // --- Parallax speed factors (1 = same speed as obstacles) ---
   PARALLAX_FAR: 0.08,
   PARALLAX_MOUNTAINS: 0.15,
@@ -225,6 +239,24 @@ function drawStar(ctx, x, y, r, color) {
   ctx.fill();
 }
 
+// A heart centred on (cx, cy). size is its full width. Pass null to skip fill.
+function drawHeart(ctx, cx, cy, size, fill, stroke) {
+  const s = size / 2;
+  ctx.beginPath();
+  ctx.moveTo(cx, cy + s * 0.9);
+  ctx.bezierCurveTo(cx - s * 1.3, cy + s * 0.05, cx - s * 0.9, cy - s * 1.05, cx, cy - s * 0.4);
+  ctx.bezierCurveTo(cx + s * 0.9, cy - s * 1.05, cx + s * 1.3, cy + s * 0.05, cx, cy + s * 0.9);
+  ctx.closePath();
+  if (fill) {
+    ctx.fillStyle = fill;
+    ctx.fill();
+  }
+  ctx.lineWidth = 2.5;
+  ctx.strokeStyle = stroke;
+  ctx.stroke();
+  if (fill) ellipse(ctx, cx - s * 0.42, cy - s * 0.35, s * 0.18, s * 0.11, -0.6, "rgba(255,255,255,0.6)"); // shine
+}
+
 // Draw one bamboo stalk. (cx, top) is the top-centre; h is its height.
 // Shared by the collectible sticks and the HUD icon.
 function drawBambooStalk(ctx, cx, top, h) {
@@ -253,14 +285,19 @@ function drawBambooStalk(ctx, cx, top, h) {
 
 
 /* =====================================================================
-   3. Sound - tiny synthesized beeps (no audio files needed)
+   3. Sound - synthesized sound effects and music (no audio files needed)
    Browsers only allow audio after the user interacts with the page, so
    the AudioContext is created on the first key press (see unlock()).
+
+   Audio routing:   sound effects --> sfxBus   --\
+                    music notes   --> musicBus --+--> master --> speakers
+   Muting sets the master volume to 0, which silences everything at once.
    ===================================================================== */
 class Sound {
   constructor() {
     this.ctx = null;
     this.muted = false;
+    this.music = new Music(this);
   }
 
   // Called on every key press; creates/resumes audio the first time.
@@ -269,8 +306,27 @@ class Sound {
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
       if (!AudioCtx) return;
       try { this.ctx = new AudioCtx(); } catch (e) { return; }
+      this.master = this.ctx.createGain();
+      this.master.gain.value = this.muted ? 0 : 1;
+      this.master.connect(this.ctx.destination);
+      this.sfxBus = this.ctx.createGain();
+      this.sfxBus.connect(this.master);
+      this.musicBus = this.ctx.createGain();
+      this.musicBus.gain.value = 0; // silent until the music starts
+      this.musicBus.connect(this.master);
+      // One second of white noise, reused for the hi-hat "tick"
+      const len = this.ctx.sampleRate;
+      this.noiseBuffer = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+      const data = this.noiseBuffer.getChannelData(0);
+      for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
     }
     if (this.ctx.state === "suspended") this.ctx.resume();
+  }
+
+  // M key: mute / unmute music and sound effects together.
+  toggleMute() {
+    this.muted = !this.muted;
+    if (this.master) this.master.gain.setTargetAtTime(this.muted ? 0 : 1, this.ctx.currentTime, 0.01);
   }
 
   // Play one tone that slides from freq to endFreq and fades out.
@@ -284,9 +340,38 @@ class Sound {
     if (endFreq !== freq) osc.frequency.exponentialRampToValueAtTime(endFreq, t0 + duration);
     gain.gain.setValueAtTime(volume, t0);
     gain.gain.exponentialRampToValueAtTime(0.001, t0 + duration);
-    osc.connect(gain).connect(this.ctx.destination);
+    osc.connect(gain).connect(this.sfxBus);
     osc.start(t0);
     osc.stop(t0 + duration + 0.02);
+  }
+
+  // Cartoon "oww!": a sliding-down tone with a fast wobble (vibrato),
+  // softened by a low-pass filter. The music dips so it stands out.
+  ouch() {
+    if (!this.ctx || this.muted) return;
+    const t0 = this.ctx.currentTime;
+    const dur = 0.42;
+    const osc = this.ctx.createOscillator();
+    osc.type = "sawtooth";
+    osc.frequency.setValueAtTime(820, t0);
+    osc.frequency.exponentialRampToValueAtTime(300, t0 + dur);
+    // Wobble: a second, slow oscillator nudges the pitch up and down
+    const lfo = this.ctx.createOscillator();
+    const lfoDepth = this.ctx.createGain();
+    lfo.frequency.value = 16;
+    lfoDepth.gain.value = 45;
+    lfo.connect(lfoDepth).connect(osc.frequency);
+    const filter = this.ctx.createBiquadFilter();
+    filter.type = "lowpass";
+    filter.frequency.value = 1800;
+    const gain = this.ctx.createGain();
+    gain.gain.setValueAtTime(0.001, t0);
+    gain.gain.exponentialRampToValueAtTime(0.3, t0 + 0.03);
+    gain.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+    osc.connect(filter).connect(gain).connect(this.sfxBus);
+    osc.start(t0); lfo.start(t0);
+    osc.stop(t0 + dur + 0.02); lfo.stop(t0 + dur + 0.02);
+    this.music.duck();
   }
 
   jump()    { this.tone(260, 640, 0.18, "sine", 0.25); }                    // "boing"
@@ -298,6 +383,194 @@ class Sound {
   win() {                                                                     // jingle
     const notes = [523, 659, 784, 1047, 784, 1047];
     notes.forEach((f, i) => this.tone(f, f, i === notes.length - 1 ? 0.45 : 0.14, "triangle", 0.2, i * 0.13));
+  }
+}
+
+
+/* ---------------------------------------------------------------------
+   Music - an original, bouncy 8-bit loop (16 bars in C major)
+   Each bar has 8 slots (eighth notes). In the strings below:
+     a note name like "E5" starts a note,  "-" holds the previous note,
+     "." is a rest.
+   Lead = square wave, bass = triangle wave, plus a soft noise "tick".
+   --------------------------------------------------------------------- */
+const SONG = {
+  //        chord root for the bass, then the melody for that bar
+  bars: [
+    ["C3",  "E5 . G5 E5 C5 . D5 E5"],
+    ["A2",  "C5 . A4 C5 E5 - . ."],
+    ["F2",  "F5 . A5 F5 C5 . F5 A5"],
+    ["G2",  "G5 - F5 E5 D5 - . ."],
+    ["C3",  "E5 . G5 E5 C6 . B5 A5"],
+    ["A2",  "G5 . E5 C5 A4 - . ."],
+    ["F2",  "A4 C5 F5 A5 G5 F5 E5 D5"],
+    ["G2",  "D5 - E5 . D5 - . ."],
+    ["F2",  "A5 . A5 G5 F5 . A5 ."],
+    ["G2",  "B5 . B5 A5 G5 . D5 ."],
+    ["E2",  "G5 . E5 G5 B5 - A5 G5"],
+    ["A2",  "A5 - . E5 C5 - . ."],
+    ["F2",  "F5 . A5 C6 A5 . F5 ."],
+    ["G2",  "G5 . B5 D6 B5 . G5 ."],
+    ["C3",  "C6 . G5 E5 C5 . E5 G5"],
+    ["G2",  "D5 - B4 . G4 . . ."],
+  ],
+};
+
+// "A4" -> 440 Hz.  Works for natural notes and sharps like "F#4".
+function noteToFreq(name) {
+  const semis = { C: -9, D: -7, E: -5, F: -4, G: -2, A: 0, B: 2 };
+  const m = /^([A-G])(#?)(\d)$/.exec(name);
+  const n = semis[m[1]] + (m[2] ? 1 : 0) + (Number(m[3]) - 4) * 12;
+  return 440 * Math.pow(2, n / 12);
+}
+
+// Turn the SONG text into a flat list of steps (one per eighth note).
+function buildSongSteps() {
+  const steps = [];
+  for (const [root, melody] of SONG.bars) {
+    const tokens = melody.trim().split(/\s+/);
+    const rootFreq = noteToFreq(root);
+    // Bouncy bass: root, fifth, octave, fifth on the four beats
+    const bassPattern = [1, 0, 1.5, 0, 2, 0, 1.5, 0];
+    for (let i = 0; i < 8; i++) {
+      const tok = tokens[i];
+      let lead = null;
+      if (tok !== "-" && tok !== ".") {
+        let len = 1; // count how many "-" holds follow
+        while (tokens[i + len] === "-") len++;
+        lead = { freq: noteToFreq(tok), len };
+      }
+      const bass = bassPattern[i] ? { freq: rootFreq * bassPattern[i], len: 1.6 } : null;
+      steps.push({ lead, bass, beat: i % 2 === 0, downbeat: i === 0 || i === 4 });
+    }
+  }
+  return steps;
+}
+
+class Music {
+  constructor(sound) {
+    this.sound = sound;
+    this.steps = buildSongSteps();
+    this.state = "stopped"; // "stopped" | "playing" | "paused"
+    this.step = 0;          // which eighth note plays next
+    this.nextTime = 0;      // audio-clock time of that note
+    this.timer = null;
+  }
+
+  get stepLength() {
+    return 60 / CONFIG.MUSIC_BPM / 2; // one eighth note, in seconds
+  }
+
+  // Start from the beginning of the song.
+  start() {
+    this.stop();
+    if (!this.sound.ctx) return;
+    this.step = 0;
+    this.run();
+  }
+
+  pause() {
+    if (this.state !== "playing") return;
+    clearInterval(this.timer);
+    this.timer = null;
+    this.state = "paused";
+    const ctx = this.sound.ctx;
+    // Rewind past notes that were scheduled but have not sounded yet,
+    // so resuming continues exactly where the music stopped.
+    while (this.nextTime - this.stepLength > ctx.currentTime) {
+      this.nextTime -= this.stepLength;
+      this.step = (this.step - 1 + this.steps.length) % this.steps.length;
+    }
+    this.silence();
+  }
+
+  resume() {
+    if (this.state === "paused" && this.sound.ctx) this.run();
+  }
+
+  stop() {
+    clearInterval(this.timer);
+    this.timer = null;
+    if (this.state !== "stopped") this.silence();
+    this.state = "stopped";
+    this.step = 0;
+  }
+
+  // Briefly lower the music (used while "ouch" plays).
+  duck() {
+    if (this.state !== "playing") return;
+    const g = this.sound.musicBus.gain, now = this.sound.ctx.currentTime;
+    g.cancelScheduledValues(now);
+    g.setTargetAtTime(CONFIG.MUSIC_VOLUME * CONFIG.MUSIC_DUCK_AMOUNT, now, 0.02);
+    g.setTargetAtTime(CONFIG.MUSIC_VOLUME, now + CONFIG.MUSIC_DUCK_TIME, 0.1);
+  }
+
+  // ---- internals ----
+  run() {
+    const ctx = this.sound.ctx, g = this.sound.musicBus.gain;
+    this.state = "playing";
+    g.cancelScheduledValues(ctx.currentTime);
+    g.setTargetAtTime(CONFIG.MUSIC_VOLUME, ctx.currentTime, 0.02);
+    this.nextTime = ctx.currentTime + 0.06;
+    this.schedule();
+    // setInterval only wakes us up; the notes themselves are timed precisely
+    // on the audio clock, so the tempo stays steady even if a timer is late.
+    this.timer = setInterval(() => this.schedule(), CONFIG.MUSIC_LOOKAHEAD_MS);
+  }
+
+  silence() {
+    const ctx = this.sound.ctx;
+    if (!ctx) return;
+    const g = this.sound.musicBus.gain;
+    g.cancelScheduledValues(ctx.currentTime);
+    g.setTargetAtTime(0, ctx.currentTime, 0.015);
+  }
+
+  // Schedule every note that falls inside the next MUSIC_SCHEDULE_AHEAD seconds.
+  schedule() {
+    const ctx = this.sound.ctx;
+    while (this.nextTime < ctx.currentTime + CONFIG.MUSIC_SCHEDULE_AHEAD) {
+      this.playStep(this.steps[this.step], this.nextTime);
+      this.nextTime += this.stepLength;
+      this.step = (this.step + 1) % this.steps.length;
+    }
+  }
+
+  playStep(s, t) {
+    const L = this.stepLength;
+    if (s.lead) this.note("square", s.lead.freq, t, s.lead.len * L * 0.85, 0.16);
+    if (s.bass) this.note("triangle", s.bass.freq, t, s.bass.len * L * 0.8, 0.45);
+    // Light percussion: a short noise tick on every beat, louder on beats 1 and 3
+    this.tick(t, s.downbeat ? 0.14 : s.beat ? 0.07 : 0.035);
+  }
+
+  note(type, freq, t, dur, vol) {
+    const ctx = this.sound.ctx;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, t);
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(vol, t + 0.008);       // quick attack
+    gain.gain.setTargetAtTime(vol * 0.6, t + 0.03, 0.05);        // settle
+    gain.gain.setTargetAtTime(0.0001, t + dur - 0.02, 0.015);    // release
+    osc.connect(gain).connect(this.sound.musicBus);
+    osc.start(t);
+    osc.stop(t + dur + 0.1);
+  }
+
+  tick(t, vol) {
+    const ctx = this.sound.ctx;
+    const src = ctx.createBufferSource();
+    src.buffer = this.sound.noiseBuffer;
+    const filter = ctx.createBiquadFilter();
+    filter.type = "highpass";
+    filter.frequency.value = 7000;
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(vol, t);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.04);
+    src.connect(filter).connect(gain).connect(this.sound.musicBus);
+    src.start(t, Math.random() * 0.5, 0.05);
   }
 }
 
@@ -953,6 +1226,9 @@ class Game {
     this.confetti = [];
     this.hitBy = null;           // "rock" or "branch" after a crash
     this.endTime = 0;            // when the run ended
+    this.lives = CONFIG.START_LIVES;
+    this.heartLostAt = [];       // heartLostAt[i] = time heart i was lost (for its animation)
+    this.invincibleTimer = 0;    // > 0 while the panda flashes and can't be hurt
     this.panda.reset();
     // Distance (px) still to scroll before the next obstacle appears
     this.distToNextObstacle = CONFIG.START_SPEED * CONFIG.FIRST_OBSTACLE_DELAY;
@@ -981,16 +1257,21 @@ class Game {
     // something to grab right away.
     const firstObstacleX = CONFIG.WIDTH + 20 + this.distToNextObstacle;
     this.placeBambooPatterns(CONFIG.WIDTH - 200, firstObstacleX);
+    this.sound.music.start();
   }
 
   pause() {
-    if (this.state === "playing") this.state = "paused";
+    if (this.state === "playing") {
+      this.state = "paused";
+      this.sound.music.pause();
+    }
   }
 
   resume() {
     if (this.state === "paused") {
       this.state = "playing";
       this.panda.setDuck(this.keys.has("ArrowDown"));
+      this.sound.music.resume();
     }
   }
 
@@ -1001,6 +1282,8 @@ class Game {
     this.bestScore = Math.max(this.bestScore, this.count);
     this.panda.wantsDuck = false;
     this.panda.vy = Math.max(this.panda.vy, 0); // stop rising, fall to the ground
+    this.invincibleTimer = 0;
+    this.sound.music.stop();
     this.sound.thud();
   }
 
@@ -1008,6 +1291,8 @@ class Game {
     this.state = "win";
     this.endTime = this.time;
     this.bestScore = Math.max(this.bestScore, this.count);
+    this.invincibleTimer = 0;
+    this.sound.music.stop(); // so the jingle plays on its own
     this.sound.win();
     // Confetti and falling bamboo leaves
     const colors = ["#ff6b6b", "#ffd93d", "#6bcB77", "#4d96ff", "#ff9ff3", "#ffffff"];
@@ -1033,7 +1318,7 @@ class Game {
     if (!e.repeat) this.keys.add(key);
 
     if (key === "h" || key === "H") { this.debug = !this.debug; return; }
-    if (key === "m" || key === "M") { this.sound.muted = !this.sound.muted; return; }
+    if (key === "m" || key === "M") { this.sound.toggleMute(); return; }
 
     switch (this.state) {
       case "title":
@@ -1217,17 +1502,42 @@ class Game {
       }
     }
 
-    // Any obstacle touch ends the run.
-    for (const o of this.obstacles) {
-      for (const box of o.getHitboxes()) {
-        if (overlaps(pandaBox, box)) {
-          this.gameOver(o.kind);
-          return;
+    // Touching an obstacle costs a heart, unless the panda is still flashing
+    // from the last hit. Each obstacle can only ever hurt him once.
+    if (this.invincibleTimer > 0) {
+      this.invincibleTimer = Math.max(0, this.invincibleTimer - dt);
+    } else {
+      for (const o of this.obstacles) {
+        if (o.hasHit) continue;
+        if (o.getHitboxes().some((box) => overlaps(pandaBox, box))) {
+          o.hasHit = true;
+          this.loseLife(o.kind);
+          if (this.state !== "playing") return; // that was the last heart
+          break;
         }
       }
     }
 
     this.updateParticles(dt);
+  }
+
+  loseLife(kind) {
+    this.lives--;
+    this.heartLostAt[this.lives] = this.time;
+    if (this.lives <= 0) {
+      this.gameOver(kind);
+      return;
+    }
+    this.invincibleTimer = CONFIG.INVINCIBLE_TIME;
+    this.sound.ouch();
+    this.particles.push({ type: "ouch", text: "Ouch!", x: this.panda.x + 10, y: this.panda.y - 95,
+      vy: -30, life: 0.9, max: 0.9 });
+  }
+
+  // Is the panda in the "hidden" half of a flash right now?
+  get flashHidden() {
+    if (this.invincibleTimer <= 0) return false;
+    return Math.floor(this.invincibleTimer * CONFIG.INVINCIBLE_FLASH_HZ * 2) % 2 === 1;
   }
 
   collect(b) {
@@ -1286,7 +1596,9 @@ class Game {
       // Happy hopping
       this.panda.y = CONFIG.GROUND_Y - Math.abs(Math.sin((this.time - this.endTime) * 6)) * 28;
     }
+    if (this.flashHidden) ctx.globalAlpha = 0.25; // blink while invincible
     this.panda.draw(ctx, mode, this.time);
+    ctx.globalAlpha = 1;
 
     this.drawParticles(ctx);
     if (this.state === "win") this.drawConfetti(ctx);
@@ -1306,6 +1618,8 @@ class Game {
       ctx.globalAlpha = alpha;
       if (p.type === "text") {
         drawText(ctx, p.text, p.x, p.y, 20, "#fff4a3", { stroke: "#3f7d22", strokeWidth: 4 });
+      } else if (p.type === "ouch") {
+        drawText(ctx, p.text, p.x, p.y, 22, "#ffffff", { stroke: "#c0392b", strokeWidth: 5 });
       } else if (p.type === "banner") {
         drawText(ctx, p.text, p.x, p.y, 36, "#ffffff", { stroke: "#d35400", strokeWidth: 6 });
       } else {
@@ -1356,10 +1670,56 @@ class Game {
     ctx.strokeStyle = "#3f7d22";
     ctx.stroke();
 
-    // Small help text in the top-right corner
+    this.drawHearts(ctx);
+
+    // Small help text in the bottom-right corner, on the dirt
     const soundLabel = this.sound.muted ? "M: sound off" : "M: sound on";
-    drawText(ctx, `P: pause   ${soundLabel}   H: hitboxes`, CONFIG.WIDTH - 14, 20, 12,
-      "rgba(30,60,30,0.75)", { align: "right" });
+    drawText(ctx, `P: pause   ${soundLabel}   H: hitboxes`, CONFIG.WIDTH - 14, CONFIG.HEIGHT - 12, 12,
+      "rgba(255,245,225,0.8)", { align: "right" });
+  }
+
+  // Hearts in the top-right corner: red = life left, gray outline = used.
+  drawHearts(ctx) {
+    const size = 26, gap = 36;
+    for (let i = 0; i < CONFIG.START_LIVES; i++) {
+      const cx = CONFIG.WIDTH - 30 - (CONFIG.START_LIVES - 1 - i) * gap;
+      const cy = 34;
+      if (i < this.lives) {
+        drawHeart(ctx, cx, cy, size, "#e8333f", "#8e1621");
+        continue;
+      }
+      // Lost heart: gray outline, plus the breaking animation for a moment
+      const t = this.time - (this.heartLostAt[i] ?? -99);
+      const k = Math.min(1, t / CONFIG.HEART_BREAK_TIME);
+      ctx.globalAlpha = 0.35 + 0.65 * k;
+      drawHeart(ctx, cx, cy, size, null, "#9a9a9a");
+      ctx.globalAlpha = 1;
+      if (k < 1) {
+        // The two halves pop up a little, crack apart, tilt and fade out
+        const pop = k < 0.2 ? 1 + k * 1.5 : 1.3 - (k - 0.2) * 0.5;
+        const spread = k * 14, tilt = k * 0.6, drop = k * k * 18;
+        for (const side of [-1, 1]) {
+          ctx.save();
+          ctx.globalAlpha = 1 - k;
+          ctx.translate(cx + side * spread, cy + drop);
+          ctx.rotate(side * tilt);
+          ctx.scale(pop, pop);
+          ctx.beginPath();
+          // Clip to one half along a zigzag crack line
+          ctx.moveTo(0, -size);
+          ctx.lineTo(side * size, -size);
+          ctx.lineTo(side * size, size);
+          ctx.lineTo(0, size);
+          ctx.lineTo(side * 3, size * 0.2);
+          ctx.lineTo(-side * 3, 0);
+          ctx.lineTo(side * 3, -size * 0.25);
+          ctx.closePath();
+          ctx.clip();
+          drawHeart(ctx, 0, 0, size, "#e8333f", "#8e1621");
+          ctx.restore();
+        }
+      }
+    }
   }
 
   drawTitle(ctx) {
@@ -1369,7 +1729,7 @@ class Game {
     drawPanel(ctx, 320, 120, 400, 170);
     drawText(ctx, "↑ Jump,  ↓ Duck,  collect 50 bamboo!", 520, 152, 20, "#2f5d1a");
     drawText(ctx, "Jump over rocks  •  Duck under branches", 520, 184, 15, "#555");
-    drawText(ctx, "Hold ↓ in the air to drop faster", 520, 206, 15, "#555");
+    drawText(ctx, `Hold ↓ in the air to drop faster  •  ${CONFIG.START_LIVES} lives`, 520, 206, 15, "#555");
     drawText(ctx, "P / Esc pause  •  M mute  •  H hitboxes", 520, 228, 13, "#777");
     if (Math.floor(this.time * 2) % 2 === 0) {
       drawText(ctx, "Press Space to Start", 520, 264, 24, "#d35400");
@@ -1385,7 +1745,7 @@ class Game {
   }
 
   drawGameOver(ctx) {
-    drawPanel(ctx, 190, 70, 420, 180);
+    drawPanel(ctx, 160, 70, 480, 180);
     drawText(ctx, `Oops! The panda bonked into a ${this.hitBy}!`, 400, 105, 22, "#c0392b");
     drawText(ctx, `Bamboo this run: ${this.count}`, 400, 145, 20, "#2f5d1a");
     drawText(ctx, `Best this session: ${this.bestScore}`, 400, 175, 18, "#555");
@@ -1412,7 +1772,7 @@ class Game {
     for (const o of this.obstacles) for (const b of o.getHitboxes()) outline(b, "#ff1744");
     for (const b of this.bamboos) outline(b.getHitbox(), "#ffab00");
     drawText(ctx, `DEBUG  speed ${Math.round(this.speed)} px/s  fps ${Math.round(this.fps)}`,
-      CONFIG.WIDTH - 14, 40, 12, "#b00020", { align: "right" });
+      CONFIG.WIDTH - 14, 66, 12, "#b00020", { align: "right" });
   }
 }
 
