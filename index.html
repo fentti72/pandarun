@@ -87,7 +87,8 @@ const CONFIG = {
   RANDOM_GAP: 1.2,           // up to this much random extra time between obstacles
   RANDOM_GAP_SHRINK: 0.15,   // random extra shrinks by this much per difficulty step
   RANDOM_GAP_MIN: 0.35,      // ...but never below this
-  BRANCH_CHANCE: 0.4,        // probability that an obstacle is a branch (else rock)
+  OVERHEAD_CHANCE: 0.4,      // probability that an obstacle is overhead (duck) rather than ground (jump)
+  GROUND_OBSTACLE_MAX_HEIGHT: 36, // safe height limit for anything you jump over
 
   // --- Rocks ---
   ROCK_SIZES: [              // small and medium; all are jumpable (checked at startup)
@@ -96,7 +97,17 @@ const CONFIG = {
     { w: 46, h: 36 },
   ],
 
-  // --- Branches ---
+  // --- New hazards ---
+  LAVA_MIN_WIDTH: 60,        // narrowest lava pit
+  LAVA_MAX_WIDTH: 110,       // widest lava pit (checked to be jumpable at top speed)
+  BIRD_EXTRA_SPEED: 70,      // birds fly this much faster than the ground scrolls (px/s)
+
+  // --- Zones (spring -> autumn -> snow -> desert -> volcano) ---
+  ZONES_ENABLED: true,       // false = spring scenery and all obstacle styles mixed together
+  ZONE_EVERY: 10,            // a new zone every N bamboo
+  ZONE_FADE_TIME: 2.5,       // seconds for the background colors to fade to the new zone
+
+  // --- Branches (and every other overhead hazard) ---
   BRANCH_WIDTH: 110,         // horizontal size of the leafy branch
   BRANCH_THICKNESS: 40,      // vertical size of the leafy part (its hitbox)
   BRANCH_CLEARANCE: 50,      // gap between ground and the lowest leaves
@@ -117,6 +128,9 @@ const CONFIG = {
 
   // --- Lives ---
   START_LIVES: 2,            // hearts at the start of each game
+  MAX_LIVES: 3,              // heart pickups can raise lives up to this
+  HEART_SPAWN_CHANCE: 0.25,  // chance per obstacle of a heart pickup (once the gap below has passed)
+  HEART_MIN_BAMBOO_GAP: 15,  // at least this many bamboo between heart pickups
   INVINCIBLE_TIME: 2.0,      // seconds of invincibility after losing a heart
   INVINCIBLE_FLASH_HZ: 8,    // how many times per second the panda blinks while invincible
   HEART_BREAK_TIME: 0.6,     // length of the "heart breaks" animation (seconds)
@@ -380,6 +394,29 @@ class Sound {
   thud()    { this.tone(170, 45, 0.3, "square", 0.14);                       // "thud"
               this.tone(95, 40, 0.35, "sine", 0.4); }
   levelUp() { this.tone(660, 990, 0.15, "triangle", 0.12); }
+  powerUp() {                                                                 // heart pickup
+    [523, 659, 784, 1047].forEach((f, i) => this.tone(f, f * 1.02, 0.12, "square", 0.12, i * 0.06));
+    this.tone(1568, 2093, 0.25, "triangle", 0.12, 0.24);
+  }
+
+  // Lava "sssss": filtered noise sweeping down, layered on top of the ouch.
+  sizzle() {
+    if (!this.ctx || this.muted) return;
+    const t0 = this.ctx.currentTime;
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.noiseBuffer;
+    const filter = this.ctx.createBiquadFilter();
+    filter.type = "bandpass";
+    filter.Q.value = 1.2;
+    filter.frequency.setValueAtTime(5000, t0);
+    filter.frequency.exponentialRampToValueAtTime(900, t0 + 0.55);
+    const gain = this.ctx.createGain();
+    gain.gain.setValueAtTime(0.001, t0);
+    gain.gain.exponentialRampToValueAtTime(0.35, t0 + 0.03);
+    gain.gain.exponentialRampToValueAtTime(0.001, t0 + 0.6);
+    src.connect(filter).connect(gain).connect(this.sfxBus);
+    src.start(t0, 0, 0.62);
+  }
   win() {                                                                     // jingle
     const notes = [523, 659, 784, 1047, 784, 1047];
     notes.forEach((f, i) => this.tone(f, f, i === notes.length - 1 ? 0.45 : 0.14, "triangle", 0.2, i * 0.13));
@@ -849,162 +886,1125 @@ function drawPandaHappy(ctx, time) {
 
 
 /* =====================================================================
-   5. Obstacle - rocks and branches
-   Every obstacle scrolls left at the world speed. Branches have two
-   hitboxes: the leafy part (duck under it) and the trunk above it.
+   5. Obstacles
+   Every obstacle style lives in the OBSTACLE_TYPES registry below.
+   Each entry has:
+     id, name     - a unique id and a readable name
+     category     - "rock", "branch", "log", "bush", "cactus", "lava",
+                    "beehive" or "bird"
+     kind         - "ground" (jump over it) or "overhead" (duck under it)
+     label        - the word used on the Game Over screen
+     zones        - which themed zones it appears in (see ZONES)
+     minBamboo    - it only appears once you have this many bamboo
+     make(o)      - sets the size (o.w, o.h) and any random details
+     boxes(o)     - the SOLID parts as rectangles {x, y, w, h}. x is
+                    measured from the obstacle's left edge; y is a normal
+                    screen y. These become the hitboxes (shrunk by
+                    HITBOX_INSET). Decorations such as moss, flowers, bees,
+                    glow or sparks are drawn but NOT listed here, so they
+                    never hurt the panda.
+     draw(ctx, o, t) - draws it (t = game time, for animations)
+   Fairness rules (checked automatically at startup, see the console):
+     ground boxes are at most GROUND_OBSTACLE_MAX_HEIGHT tall, and
+     overhead boxes end at least BRANCH_CLEARANCE above the ground.
+   To add a style, copy an entry and change it.
    ===================================================================== */
-class Obstacle {
-  constructor(kind, x) {
-    this.kind = kind; // "rock" or "branch"
-    this.x = x;
-    if (kind === "rock") {
-      const size = choose(CONFIG.ROCK_SIZES);
-      this.w = size.w;
-      this.h = size.h;
-      this.y = CONFIG.GROUND_Y - this.h;
-      // A lumpy outline: points around a half-ellipse with random wobble
-      this.points = [];
-      const n = 8;
-      for (let i = 0; i <= n; i++) {
-        const a = Math.PI - (Math.PI * i) / n;
-        const r = i === 0 || i === n ? 1 : rand(0.86, 1);
-        this.points.push({
-          x: this.w / 2 + Math.cos(a) * (this.w / 2) * r,
-          y: -Math.sin(a) * this.h * r,
-        });
-      }
-      this.hasMoss = Math.random() < 0.5;
-    } else {
-      this.w = CONFIG.BRANCH_WIDTH;
-      this.bottom = CONFIG.GROUND_Y - CONFIG.BRANCH_CLEARANCE; // lowest leaf
-      this.top = this.bottom - CONFIG.BRANCH_THICKNESS;         // top of leafy part
-      this.trunkW = 22;
-      this.leafSeed = Math.random() * 1000;
-    }
-  }
 
-  get trunkX() {
-    return this.x + this.w - 34;
+const ALL_ZONES = ["spring", "autumn", "snow", "desert", "volcano"];
+
+/* ---------- Shared helpers: rocks ---------- */
+
+// Pick a rock size and build a lumpy outline for it.
+function makeRock(o, jagged = false) {
+  const s = choose(CONFIG.ROCK_SIZES);
+  o.w = s.w;
+  o.h = s.h;
+  o.rw = s.w; // width of the rock body itself
+  o.points = rockOutline(o.rw, o.h, jagged);
+}
+
+// Points around a half-ellipse with random wobble (relative to bottom-left;
+// up is negative y). jagged = sharper, spikier outline.
+function rockOutline(w, h, jagged) {
+  const pts = [];
+  const n = jagged ? 10 : 8;
+  for (let i = 0; i <= n; i++) {
+    const a = Math.PI - (Math.PI * i) / n;
+    let r = 1;
+    if (i !== 0 && i !== n) r = jagged ? (i % 2 ? rand(0.68, 0.82) : rand(0.95, 1)) : rand(0.86, 1);
+    pts.push({ x: w / 2 + Math.cos(a) * (w / 2) * r, y: -Math.sin(a) * h * r });
+  }
+  return pts;
+}
+
+// One box covering the whole obstacle, sitting on the ground.
+const groundBox = (o) => [{ x: 0, y: CONFIG.GROUND_Y - o.h, w: o.w, h: o.h }];
+
+function rockPath(ctx, o) {
+  ctx.beginPath();
+  for (const p of o.points) ctx.lineTo(o.x + p.x, CONFIG.GROUND_Y + p.y);
+  ctx.closePath();
+}
+
+// Fill and outline the rock with a top-to-bottom gradient.
+function paintRock(ctx, o, light, dark, outline) {
+  const gy = CONFIG.GROUND_Y;
+  rockPath(ctx, o);
+  const g = ctx.createLinearGradient(0, gy - o.h, 0, gy);
+  g.addColorStop(0, light);
+  g.addColorStop(1, dark);
+  ctx.fillStyle = g;
+  ctx.fill();
+  ctx.lineWidth = 2;
+  ctx.lineJoin = "round";
+  ctx.strokeStyle = outline;
+  ctx.stroke();
+}
+
+function rockHighlight(ctx, o, alpha = 0.4) {
+  ellipse(ctx, o.x + o.rw * 0.35, CONFIG.GROUND_Y - o.h * 0.68, o.rw * 0.14, o.h * 0.1, -0.4, `rgba(255,255,255,${alpha})`);
+}
+
+function rockCrack(ctx, o, color = "rgba(40,40,45,0.6)", width = 1.3) {
+  const gy = CONFIG.GROUND_Y, x = o.x, w = o.rw, h = o.h;
+  ctx.beginPath();
+  ctx.moveTo(x + w * 0.62, gy - h * 0.8);
+  ctx.lineTo(x + w * 0.55, gy - h * 0.5);
+  ctx.lineTo(x + w * 0.64, gy - h * 0.28);
+  ctx.moveTo(x + w * 0.55, gy - h * 0.5);
+  ctx.lineTo(x + w * 0.43, gy - h * 0.4);
+  ctx.lineWidth = width;
+  ctx.strokeStyle = color;
+  ctx.stroke();
+}
+
+// Run drawFn with drawing clipped to the rock's outline (for moss, snow, stripes).
+function insideRock(ctx, o, drawFn) {
+  ctx.save();
+  rockPath(ctx, o);
+  ctx.clip();
+  drawFn();
+  ctx.restore();
+}
+
+// A tiny five-petal flower on a stem.
+function drawFlower(ctx, x, y, color) {
+  const gy = CONFIG.GROUND_Y;
+  ctx.beginPath();
+  ctx.moveTo(x, gy);
+  ctx.lineTo(x, y);
+  ctx.strokeStyle = "#3f8a2c";
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+  for (let i = 0; i < 5; i++) {
+    const a = (i * Math.PI * 2) / 5;
+    ellipse(ctx, x + Math.cos(a) * 2.4, y + Math.sin(a) * 2.4, 2, 2, 0, color);
+  }
+  ellipse(ctx, x, y, 1.4, 1.4, 0, "#ffd23f");
+}
+
+/* ---------- Shared helpers: branches ---------- */
+
+// All tree branches share the same safe "hanging band": from o.top down to
+// o.bottom, which is BRANCH_CLEARANCE above the ground.
+function makeBranch(o) {
+  o.w = CONFIG.BRANCH_WIDTH;
+  o.bottom = CONFIG.GROUND_Y - CONFIG.BRANCH_CLEARANCE; // lowest SOLID point
+  o.top = o.bottom - CONFIG.BRANCH_THICKNESS;           // top of the branch area
+  o.trunkW = 22;
+  o.trunkX = o.w - 34;
+  o.seed = randInt(1, 100000);
+}
+
+// Solid parts: the branch (from solidTop down to o.bottom) and the trunk above it.
+function branchBoxes(o, solidTop = o.top) {
+  return [
+    { x: 0, y: solidTop, w: o.w, h: o.bottom - solidTop },
+    { x: o.trunkX, y: 0, w: o.trunkW, h: o.top + 12 },
+  ];
+}
+
+// Vertical trunk coming down from the top edge of the screen.
+function drawTrunk(ctx, o, color = "#6b4426", dark = "#4a2e17") {
+  const tx = o.x + o.trunkX;
+  ctx.fillStyle = color;
+  ctx.fillRect(tx, 0, o.trunkW, o.top + 14);
+  ctx.strokeStyle = dark;
+  ctx.lineWidth = 2;
+  ctx.strokeRect(tx, -2, o.trunkW, o.top + 16);
+  ctx.lineWidth = 1.2;
+  for (let yy = 30; yy < o.top; yy += 26) {
+    ctx.beginPath();
+    ctx.moveTo(tx + 5, yy);
+    ctx.quadraticCurveTo(tx + 11, yy + 6, tx + 7, yy + 14);
+    ctx.stroke();
+  }
+}
+
+// Leafy blobs along the top edge (far above the panda's reach; decoration).
+function drawCanopy(ctx, o, colors) {
+  const rnd = seededRandom(o.seed);
+  for (let i = 0; i < 7; i++) {
+    const cx = o.x - 20 + (i / 6) * (o.w + 40);
+    ellipse(ctx, cx, 6 + rnd() * 10, 22 + rnd() * 8, 16 + rnd() * 6, 0, colors[i % colors.length]);
+  }
+}
+
+// The classic thin, slightly drooping limb from the trunk to the left.
+function drawLimb(ctx, o, color = "#7a4e2c", dark = "#4a2e17") {
+  const x = o.x, w = o.w, top = o.top, tx = o.x + o.trunkX;
+  ctx.beginPath();
+  ctx.moveTo(tx + 8, top + 2);
+  ctx.quadraticCurveTo(x + w * 0.45, top + 6, x + 2, top + 12);
+  ctx.lineTo(x + 4, top + 18);
+  ctx.quadraticCurveTo(x + w * 0.45, top + 16, tx + 8, top + 22);
+  ctx.closePath();
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.strokeStyle = dark;
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(x + w * 0.4, top + 10);
+  ctx.lineTo(x + w * 0.3, top + 1);
+  ctx.lineWidth = 3;
+  ctx.stroke();
+}
+
+// A thick limb whose underside reaches o.bottom (used by styles without
+// hanging foliage, so the branch itself is the solid part).
+function drawThickLimb(ctx, o, upper, color, dark) {
+  const x = o.x, tx = o.x + o.trunkX, b = o.bottom;
+  ctx.beginPath();
+  ctx.moveTo(tx + 10, upper);
+  ctx.quadraticCurveTo(x + o.w * 0.5, upper + 2, x + 2, upper + 6);
+  ctx.quadraticCurveTo(x - 3, (upper + b) / 2 + 3, x + 4, b - 4);
+  ctx.quadraticCurveTo(x + o.w * 0.5, b + 1, tx + 10, b);
+  ctx.closePath();
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.strokeStyle = dark;
+  ctx.lineWidth = 2;
+  ctx.stroke();
+}
+
+// x positions along a branch for hanging leaves, fruit, blossoms...
+function hangPoints(o, n) {
+  const pts = [];
+  for (let i = 0; i < n; i++) pts.push(o.x + 8 + (i / (n - 1)) * (o.w - 26));
+  return pts;
+}
+
+function drawMapleLeaf(ctx, x, y, r, color) {
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const a = -Math.PI / 2 + (i * Math.PI) / 5;
+    const rr = i % 2 === 0 ? r : r * 0.5;
+    ctx.lineTo(x + Math.cos(a) * rr, y + Math.sin(a) * rr * 0.95);
+  }
+  ctx.closePath();
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.strokeStyle = "rgba(90,30,10,0.6)";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+}
+
+function drawBlossom(ctx, x, y, r) {
+  for (let i = 0; i < 5; i++) {
+    const a = -Math.PI / 2 + (i * Math.PI * 2) / 5;
+    ellipse(ctx, x + Math.cos(a) * r * 0.55, y + Math.sin(a) * r * 0.55, r * 0.5, r * 0.5, 0, "#f9b9d0", "#e584a8", 0.8);
+  }
+  ellipse(ctx, x, y, r * 0.25, r * 0.25, 0, "#e0557f");
+}
+
+function drawBee(ctx, x, y, dir, t) {
+  const flap = Math.sin(t * 40) * 2;
+  ellipse(ctx, x - dir * 1, y - 4 - flap * 0.3, 3, 2 + Math.abs(flap) * 0.4, 0, "rgba(255,255,255,0.75)", "rgba(80,80,80,0.5)", 0.6);
+  ellipse(ctx, x, y, 5, 3.4, 0, "#ffd23f", "#333", 1);
+  ctx.strokeStyle = "#222";
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  ctx.moveTo(x - 1, y - 3); ctx.lineTo(x - 1, y + 3);
+  ctx.moveTo(x + 2 * -dir, y - 3); ctx.lineTo(x + 2 * -dir, y + 3);
+  ctx.stroke();
+  ellipse(ctx, x + dir * 4, y - 0.5, 0.9, 0.9, 0, "#222");
+}
+
+/* ---------- The registry ---------- */
+
+const OBSTACLE_TYPES = [
+  /* ===== 10 rock styles (ground, jump over) ===== */
+  {
+    id: "rock-classic", name: "Classic gray boulder", category: "rock", kind: "ground", label: "rock",
+    zones: ALL_ZONES, minBamboo: 0,
+    make: (o) => makeRock(o), boxes: groundBox,
+    draw(ctx, o) {
+      paintRock(ctx, o, "#b4b8be", "#5e646c", "#3e4249");
+      rockHighlight(ctx, o, 0.45);
+      rockCrack(ctx, o);
+    },
+  },
+  {
+    id: "rock-mossy", name: "Mossy rock", category: "rock", kind: "ground", label: "rock",
+    zones: ["spring", "autumn"], minBamboo: 0,
+    make: (o) => makeRock(o), boxes: groundBox,
+    draw(ctx, o) {
+      const gy = CONFIG.GROUND_Y;
+      paintRock(ctx, o, "#a3aaa2", "#57605a", "#3a423c");
+      insideRock(ctx, o, () => {
+        ellipse(ctx, o.x + o.rw * 0.5, gy - o.h, o.rw * 0.62, o.h * 0.42, 0, "#5d9e3c");
+        ellipse(ctx, o.x + o.rw * 0.3, gy - o.h * 0.62, o.rw * 0.12, o.h * 0.14, 0, "#5d9e3c");
+        ellipse(ctx, o.x + o.rw * 0.72, gy - o.h * 0.6, o.rw * 0.08, o.h * 0.12, 0, "#5d9e3c");
+        ellipse(ctx, o.x + o.rw * 0.42, gy - o.h * 0.88, o.rw * 0.16, o.h * 0.08, 0, "#8cc95e");
+      });
+      rockPath(ctx, o);
+      ctx.strokeStyle = "#3a423c";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    },
+  },
+  {
+    id: "rock-cairn", name: "Flat stacked stones (cairn)", category: "rock", kind: "ground", label: "rock",
+    zones: ["spring", "autumn", "snow"], minBamboo: 0,
+    make(o) { o.w = o.rw = choose([40, 46]); o.h = choose([30, 36]); },
+    // Two boxes: the wide bottom stone and the narrower stack above it
+    boxes: (o) => [
+      { x: 0, y: CONFIG.GROUND_Y - o.h * 0.4, w: o.w, h: o.h * 0.4 },
+      { x: o.w * 0.12, y: CONFIG.GROUND_Y - o.h, w: o.w * 0.76, h: o.h * 0.62 },
+    ],
+    draw(ctx, o) {
+      const gy = CONFIG.GROUND_Y, x = o.x, w = o.w, h = o.h;
+      const stones = [
+        [x, gy - h * 0.38, w, h * 0.38, "#8f949b"],
+        [x + w * 0.12, gy - h * 0.7, w * 0.76, h * 0.33, "#a7acb3"],
+        [x + w * 0.27, gy - h, w * 0.46, h * 0.31, "#bcc0c6"],
+      ];
+      for (const [sx, sy, sw, sh, c] of stones) {
+        roundRectPath(ctx, sx, sy, sw, sh, sh * 0.48);
+        ctx.fillStyle = c;
+        ctx.fill();
+        ctx.strokeStyle = "#4b5057";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        ellipse(ctx, sx + sw * 0.3, sy + sh * 0.3, sw * 0.14, sh * 0.12, 0, "rgba(255,255,255,0.35)");
+      }
+    },
+  },
+  {
+    id: "rock-crystal", name: "Jagged rock with crystals", category: "rock", kind: "ground", label: "rock",
+    zones: ["snow", "desert", "volcano"], minBamboo: 0,
+    make: (o) => makeRock(o, true), boxes: groundBox,
+    draw(ctx, o, t) {
+      const gy = CONFIG.GROUND_Y, x = o.x, w = o.rw, h = o.h;
+      paintRock(ctx, o, "#757a8c", "#3d4050", "#2a2c38");
+      // Crystals grow out of the rock (kept inside its box)
+      const crystals = [[0.34, 0.55, 0.92, "#a678e8"], [0.52, 0.45, 0.98, "#6fa8ff"], [0.68, 0.5, 0.8, "#c79bff"]];
+      ctx.save();
+      ctx.shadowColor = "rgba(170,140,255,0.8)";
+      ctx.shadowBlur = 6 + Math.sin(t * 3) * 3;
+      for (const [fx, base, tip, c] of crystals) {
+        const cx = x + w * fx;
+        ctx.beginPath();
+        ctx.moveTo(cx - 4, gy - h * base);
+        ctx.lineTo(cx - 1, gy - h * tip);
+        ctx.lineTo(cx + 3, gy - h * (tip - 0.08));
+        ctx.lineTo(cx + 4, gy - h * base);
+        ctx.closePath();
+        ctx.fillStyle = c;
+        ctx.fill();
+      }
+      ctx.restore();
+      ctx.strokeStyle = "rgba(255,255,255,0.7)";
+      ctx.lineWidth = 1;
+      for (const [fx, base, tip] of crystals) {
+        ctx.beginPath();
+        ctx.moveTo(x + w * fx - 1.5, gy - h * base);
+        ctx.lineTo(x + w * fx - 0.5, gy - h * tip + 3);
+        ctx.stroke();
+      }
+    },
+  },
+  {
+    id: "rock-sandy", name: "Sandy desert rock", category: "rock", kind: "ground", label: "rock",
+    zones: ["desert"], minBamboo: 0,
+    make: (o) => makeRock(o), boxes: groundBox,
+    draw(ctx, o) {
+      const gy = CONFIG.GROUND_Y;
+      paintRock(ctx, o, "#ecc68a", "#b77f48", "#7d5530");
+      insideRock(ctx, o, () => {
+        for (let i = 1; i <= 4; i++) {
+          const y = gy - (o.h * i) / 5;
+          ctx.fillStyle = i % 2 ? "rgba(160,95,45,0.35)" : "rgba(255,235,190,0.35)";
+          ctx.fillRect(o.x - 2, y - 2.5 + Math.sin(i) * 1.5, o.rw + 4, 3.5);
+        }
+      });
+      rockHighlight(ctx, o, 0.3);
+    },
+  },
+  {
+    id: "rock-snowy", name: "Snowy rock with icicle", category: "rock", kind: "ground", label: "rock",
+    zones: ["snow"], minBamboo: 0,
+    make: (o) => makeRock(o), boxes: groundBox,
+    draw(ctx, o) {
+      const gy = CONFIG.GROUND_Y, x = o.x, w = o.rw, h = o.h;
+      paintRock(ctx, o, "#a9b2bf", "#5f6878", "#3f4655");
+      insideRock(ctx, o, () => {
+        ctx.beginPath();
+        ctx.moveTo(x - 2, gy - h * 0.55);
+        for (let i = 0; i <= 6; i++) ctx.lineTo(x + (w * i) / 6, gy - h * (0.62 + (i % 2) * 0.08));
+        ctx.lineTo(x + w + 2, gy - h - 2);
+        ctx.lineTo(x - 2, gy - h - 2);
+        ctx.closePath();
+        ctx.fillStyle = "#f7fbff";
+        ctx.fill();
+      });
+      rockPath(ctx, o);
+      ctx.strokeStyle = "#3f4655";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      // Tiny icicle (decoration)
+      ctx.beginPath();
+      ctx.moveTo(x + w * 0.78, gy - h * 0.6);
+      ctx.lineTo(x + w * 0.84, gy - h * 0.6);
+      ctx.lineTo(x + w * 0.81, gy - h * 0.38);
+      ctx.closePath();
+      ctx.fillStyle = "rgba(200,230,255,0.9)";
+      ctx.fill();
+    },
+  },
+  {
+    id: "rock-pebbles", name: "Pebble cluster", category: "rock", kind: "ground", label: "rock",
+    zones: ALL_ZONES, minBamboo: 0,
+    make(o) {
+      o.w = o.rw = choose([48, 54]);
+      o.h = choose([20, 24]);
+      // Each pebble: centre x (fraction of width), radii; all sit on the ground
+      o.pebbles = [
+        [0.2, 0.2, 0.36, "#9aa0a8"], [0.47, 0.24, 0.5, "#b0b5bc"],
+        [0.78, 0.2, 0.42, "#8c939b"], [0.62, 0.12, 0.22, "#c3c7cc"],
+      ];
+    },
+    boxes: groundBox, // one hitbox around the whole cluster
+    draw(ctx, o) {
+      const gy = CONFIG.GROUND_Y;
+      for (const [fx, frx, fry, c] of o.pebbles) {
+        const rx = o.w * frx, ry = o.h * fry;
+        ellipse(ctx, o.x + o.w * fx, gy - ry, rx, ry, 0, c, "#454b52", 1.8);
+        ellipse(ctx, o.x + o.w * fx - rx * 0.3, gy - ry * 1.4, rx * 0.3, ry * 0.18, 0, "rgba(255,255,255,0.4)");
+      }
+    },
+  },
+  {
+    id: "rock-volcanic", name: "Volcanic rock", category: "rock", kind: "ground", label: "rock",
+    zones: ["volcano"], minBamboo: 0,
+    make: (o) => makeRock(o, true), boxes: groundBox,
+    draw(ctx, o, t) {
+      const gy = CONFIG.GROUND_Y, x = o.x, w = o.rw, h = o.h;
+      paintRock(ctx, o, "#4e3c3a", "#1f1716", "#140e0d");
+      insideRock(ctx, o, () => {
+        ctx.save();
+        const glow = 0.55 + 0.3 * Math.sin(t * 3 + o.x * 0.05);
+        ctx.strokeStyle = `rgba(255,${Math.round(110 + 60 * glow)},40,${glow})`;
+        ctx.shadowColor = "#ff7a1a";
+        ctx.shadowBlur = 8;
+        ctx.lineWidth = 1.6;
+        ctx.beginPath();
+        ctx.moveTo(x + w * 0.3, gy - h * 0.7);
+        ctx.lineTo(x + w * 0.42, gy - h * 0.45);
+        ctx.lineTo(x + w * 0.35, gy - h * 0.15);
+        ctx.moveTo(x + w * 0.42, gy - h * 0.45);
+        ctx.lineTo(x + w * 0.62, gy - h * 0.38);
+        ctx.lineTo(x + w * 0.72, gy - h * 0.1);
+        ctx.stroke();
+        ctx.restore();
+      });
+    },
+  },
+  {
+    id: "rock-flowers", name: "Rock with tiny flowers", category: "rock", kind: "ground", label: "rock",
+    zones: ["spring"], minBamboo: 0,
+    make: (o) => makeRock(o), boxes: groundBox,
+    draw(ctx, o) {
+      const gy = CONFIG.GROUND_Y;
+      paintRock(ctx, o, "#c2bdb4", "#6f6a62", "#48443e");
+      rockHighlight(ctx, o, 0.4);
+      // Flowers at the base (decoration, no hitbox)
+      drawFlower(ctx, o.x - 4, gy - 9, "#ff8fb1");
+      drawFlower(ctx, o.x + 3, gy - 6, "#ffffff");
+      drawFlower(ctx, o.x + o.rw + 2, gy - 8, "#ffd23f");
+      drawFlower(ctx, o.x + o.rw - 5, gy - 5, "#b78cff");
+    },
+  },
+  {
+    id: "rock-mushroom", name: "Rock with spotted mushroom", category: "rock", kind: "ground", label: "rock",
+    zones: ["spring", "autumn"], minBamboo: 0,
+    make(o) {
+      makeRock(o);
+      o.w = o.rw + 14; // room for the mushroom on the right
+    },
+    boxes: (o) => [
+      { x: 0, y: CONFIG.GROUND_Y - o.h, w: o.rw, h: o.h },       // the rock
+      { x: o.rw - 4, y: CONFIG.GROUND_Y - 18, w: 18, h: 18 },     // the mushroom
+    ],
+    draw(ctx, o) {
+      const gy = CONFIG.GROUND_Y, mx = o.x + o.rw + 5;
+      paintRock(ctx, o, "#b0b4ba", "#5c626a", "#3e4249");
+      rockHighlight(ctx, o, 0.4);
+      roundRectPath(ctx, mx - 3.5, gy - 11, 7, 11, 2.5);
+      ctx.fillStyle = "#f3ead8";
+      ctx.fill();
+      ctx.strokeStyle = "#8a7a60";
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.ellipse(mx, gy - 10, 9, 8, 0, Math.PI, 0);
+      ctx.closePath();
+      ctx.fillStyle = "#e23b3b";
+      ctx.fill();
+      ctx.strokeStyle = "#8f1d1d";
+      ctx.stroke();
+      ellipse(ctx, mx - 4, gy - 13, 1.8, 1.6, 0, "#fff");
+      ellipse(ctx, mx + 2, gy - 16, 1.6, 1.4, 0, "#fff");
+      ellipse(ctx, mx + 5, gy - 12, 1.4, 1.2, 0, "#fff");
+    },
+  },
+
+  /* ===== 10 tree / branch styles (overhead, duck under) ===== */
+  {
+    id: "branch-oak", name: "Oak branch", category: "branch", kind: "overhead", label: "branch",
+    zones: ["spring", "autumn"], minBamboo: 0,
+    make: makeBranch, boxes: (o) => branchBoxes(o),
+    draw(ctx, o) {
+      drawTrunk(ctx, o);
+      drawCanopy(ctx, o, ["#2f6b2a", "#3c7f33"]);
+      drawLimb(ctx, o);
+      const rnd = seededRandom(o.seed);
+      for (const lx of hangPoints(o, 5)) {
+        const r = 11 + rnd() * 2;
+        ellipse(ctx, lx, o.bottom - r, r, r, 0, "#3f8f34", "#2a6324", 1.5);
+        ellipse(ctx, lx - r * 0.3, o.bottom - r * 1.35, r * 0.35, r * 0.28, 0, "rgba(255,255,255,0.18)");
+      }
+      ellipse(ctx, o.x + o.w * 0.25, o.top + 3, 10, 7, 0, "#4fa53e", "#2a6324", 1.2);
+      ellipse(ctx, o.x + o.w * 0.6, o.top + 2, 9, 6, 0, "#4fa53e", "#2a6324", 1.2);
+    },
+  },
+  {
+    id: "branch-pine", name: "Pine branch", category: "branch", kind: "overhead", label: "branch",
+    zones: ["snow", "spring"], minBamboo: 0,
+    make: makeBranch, boxes: (o) => branchBoxes(o),
+    draw(ctx, o) {
+      drawTrunk(ctx, o, "#5a3a22", "#3a2414");
+      drawCanopy(ctx, o, ["#1d4a2a", "#245a33"]);
+      drawLimb(ctx, o, "#5a3a22", "#3a2414");
+      ctx.lineCap = "round";
+      for (const lx of hangPoints(o, 5)) {
+        for (let k = -4; k <= 4; k++) {
+          ctx.beginPath();
+          ctx.moveTo(lx, o.top + 15);
+          ctx.lineTo(lx + k * 2.6, o.bottom - Math.abs(k) * 1.3);
+          ctx.strokeStyle = k % 2 ? "#1e5b33" : "#2b7044";
+          ctx.lineWidth = 2.4;
+          ctx.stroke();
+        }
+      }
+      const cone = hangPoints(o, 5)[1] + 11;
+      ellipse(ctx, cone, o.bottom - 9, 4, 8, 0, "#8a5a2b", "#5a3a1a", 1);
+    },
+  },
+  {
+    id: "branch-cherry", name: "Cherry blossom branch", category: "branch", kind: "overhead", label: "branch",
+    zones: ["spring"], minBamboo: 0,
+    make: makeBranch, boxes: (o) => branchBoxes(o),
+    draw(ctx, o) {
+      drawTrunk(ctx, o, "#5a3326", "#3a1f16");
+      drawCanopy(ctx, o, ["#f4a6c6", "#f8c3d8"]);
+      drawLimb(ctx, o, "#5a3326", "#3a1f16");
+      const rnd = seededRandom(o.seed);
+      for (const lx of hangPoints(o, 6)) {
+        const fy = o.bottom - 6;
+        ctx.beginPath();
+        ctx.moveTo(lx, o.top + 16);
+        ctx.lineTo(lx, fy);
+        ctx.strokeStyle = "#5a3326";
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        drawBlossom(ctx, lx, fy, 6);
+        drawBlossom(ctx, lx + (rnd() * 8 - 4), o.top + 22 + rnd() * 4, 5);
+      }
+    },
+  },
+  {
+    id: "branch-maple", name: "Autumn maple branch", category: "branch", kind: "overhead", label: "branch",
+    zones: ["autumn"], minBamboo: 0,
+    make: makeBranch, boxes: (o) => branchBoxes(o),
+    draw(ctx, o) {
+      drawTrunk(ctx, o);
+      drawCanopy(ctx, o, ["#d35400", "#e67e22", "#c0392b"]);
+      drawLimb(ctx, o);
+      const colors = ["#e8592a", "#f39c12", "#c0392b"];
+      hangPoints(o, 6).forEach((lx, i) => {
+        const r = 9;
+        ctx.beginPath();
+        ctx.moveTo(lx, o.top + 16);
+        ctx.lineTo(lx, o.bottom - r * 1.6);
+        ctx.strokeStyle = "#6b4426";
+        ctx.lineWidth = 1.2;
+        ctx.stroke();
+        drawMapleLeaf(ctx, lx, o.bottom - r, r, colors[i % 3]);
+      });
+    },
+  },
+  {
+    id: "branch-willow", name: "Willow branch", category: "branch", kind: "overhead", label: "branch",
+    zones: ["spring", "autumn"], minBamboo: 0,
+    make: makeBranch,
+    // Only the thick sagging limb is solid. The fringe is decoration.
+    boxes: (o) => branchBoxes(o, o.top + 8),
+    draw(ctx, o, t) {
+      const x = o.x, w = o.w, tx = o.x + o.trunkX, b = o.bottom;
+      drawTrunk(ctx, o, "#6e5a3c", "#4a3a24");
+      drawCanopy(ctx, o, ["#7fb24a", "#8fc25a"]);
+      // Limb centre line (y) at a given x, used to hang the fringe from it
+      const limbY = (px) => {
+        const mid = x + w * 0.42;
+        return px < mid ? (o.top + 24) + ((px - x) / (mid - x)) * (b - 6 - (o.top + 24))
+                        : (b - 6) + ((px - mid) / (tx - mid)) * ((o.top + 12) - (b - 6));
+      };
+      // The limb itself: a thick sagging stroke whose underside reaches o.bottom
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.moveTo(tx + 10, o.top + 12);
+      ctx.quadraticCurveTo(x + w * 0.65, b - 6, x + w * 0.42, b - 6);
+      ctx.quadraticCurveTo(x + w * 0.2, b - 6, x + 4, o.top + 24);
+      ctx.strokeStyle = "#4a3a24";
+      ctx.lineWidth = 12;
+      ctx.stroke();
+      ctx.strokeStyle = "#7a6342";
+      ctx.lineWidth = 8;
+      ctx.stroke();
+      // Drooping fringe: a see-through curtain of leafy strands draped over
+      // the limb. Wispy decoration, so it is not part of the hitbox, and it
+      // stops above the ducking panda's head.
+      for (let k = 0; k < 22; k++) {
+        const px = x + 2 + (k * (tx - x)) / 21;
+        const y0 = limbY(px) - 16;
+        const y1 = Math.min(b + 5, limbY(px) + 16);
+        const sway = Math.sin(t * 2 + k * 0.7) * 2.5;
+        ctx.beginPath();
+        ctx.moveTo(px, y0);
+        ctx.quadraticCurveTo(px + sway * 0.5, (y0 + y1) / 2, px + sway, y1);
+        ctx.strokeStyle = k % 2 ? "rgba(150,205,85,0.9)" : "rgba(105,165,55,0.9)";
+        ctx.lineWidth = 1.6;
+        ctx.stroke();
+        for (let ly = y0 + 5; ly < y1 - 2; ly += 7) {
+          const f = (ly - y0) / (y1 - y0);
+          ellipse(ctx, px + sway * f + 1.5, ly, 1.6, 3.2, 0.3, k % 2 ? "rgba(160,215,95,0.95)" : "rgba(120,180,65,0.95)");
+        }
+      }
+    },
+  },
+  {
+    id: "branch-bamboo-pole", name: "Bamboo pole on vines", category: "branch", kind: "overhead", label: "bamboo pole",
+    zones: ALL_ZONES, minBamboo: 0,
+    make(o) {
+      o.w = 120;
+      o.bottom = CONFIG.GROUND_Y - CONFIG.BRANCH_CLEARANCE;
+      o.poleTop = o.bottom - 22;
+      o.seed = randInt(1, 100000);
+    },
+    boxes: (o) => [{ x: 0, y: o.poleTop, w: o.w, h: o.bottom - o.poleTop }], // vines are decoration
+    draw(ctx, o, t) {
+      const x = o.x, w = o.w, pt = o.poleTop, ph = o.bottom - o.poleTop;
+      // Vines from the top edge down to the pole
+      for (const vx of [x + 20, x + w - 20]) {
+        ctx.beginPath();
+        ctx.moveTo(vx, -5);
+        for (let y = 0; y <= pt + 6; y += 8) ctx.lineTo(vx + Math.sin(y * 0.09 + vx) * 3, y);
+        ctx.strokeStyle = "#3f7a2a";
+        ctx.lineWidth = 3;
+        ctx.stroke();
+        for (let y = 30; y < pt - 10; y += 34) ellipse(ctx, vx + 6, y, 6, 3, -0.5, "#5cae43");
+        // Vine loop around the pole
+        ellipse(ctx, vx, pt + ph / 2, 5, ph / 2 + 2, 0, null, "#3f7a2a", 2.5);
+      }
+      // The pole
+      const g = ctx.createLinearGradient(0, pt, 0, pt + ph);
+      g.addColorStop(0, "#b8e08a");
+      g.addColorStop(0.5, "#6fbf45");
+      g.addColorStop(1, "#3f8a24");
+      roundRectPath(ctx, x, pt, w, ph, ph / 2);
+      ctx.fillStyle = g;
+      ctx.fill();
+      ctx.strokeStyle = "#2f6b1a";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.fillStyle = "#2f6b1a";
+      for (let nx = x + 26; nx < x + w - 10; nx += 26) ctx.fillRect(nx, pt + 1, 2.5, ph - 2);
+      ellipse(ctx, x + 4, pt + ph / 2, 3.5, ph / 2 - 2, 0, "#e3f2c8", "#2f6b1a", 1);
+      // Re-draw the front of the vine loops over the pole
+      for (const vx of [x + 20, x + w - 20]) {
+        ctx.beginPath();
+        ctx.moveTo(vx - 5, pt + 2);
+        ctx.lineTo(vx + 5, o.bottom - 2);
+        ctx.strokeStyle = "#3f7a2a";
+        ctx.lineWidth = 2.5;
+        ctx.stroke();
+      }
+    },
+  },
+  {
+    id: "branch-vine", name: "Vine-wrapped branch", category: "branch", kind: "overhead", label: "branch",
+    zones: ["spring", "autumn", "desert", "volcano"], minBamboo: 0,
+    make: makeBranch, boxes: (o) => branchBoxes(o, o.top + 8),
+    draw(ctx, o, t) {
+      const x = o.x, tx = o.x + o.trunkX;
+      drawTrunk(ctx, o);
+      drawCanopy(ctx, o, ["#2f6b2a", "#3c7f33"]);
+      // Dangling leaves on short vines (decoration, kept just under the branch)
+      for (const lx of hangPoints(o, 4)) {
+        const sway = Math.sin(t * 2 + lx) * 1.5;
+        ctx.beginPath();
+        ctx.moveTo(lx + 6, o.bottom - 6);
+        ctx.lineTo(lx + 6 + sway, o.bottom);
+        ctx.strokeStyle = "#3f7a2a";
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        ellipse(ctx, lx + 6 + sway, o.bottom + 1.5, 2.6, 3.5, 0, "#5cae43");
+      }
+      drawThickLimb(ctx, o, o.top + 8, "#7a4e2c", "#4a2e17");
+      // Vine spiralling around the branch
+      ctx.beginPath();
+      const mid = (o.top + 8 + o.bottom) / 2;
+      for (let px = x + 4; px <= tx + 8; px += 3) ctx.lineTo(px, mid + Math.sin(px * 0.16) * 12);
+      ctx.strokeStyle = "#3f8a2c";
+      ctx.lineWidth = 3;
+      ctx.stroke();
+      for (let px = x + 12; px < tx; px += 22) ellipse(ctx, px, mid + Math.sin(px * 0.16) * 12 - 3, 5, 3, -0.4, "#6cc04a");
+    },
+  },
+  {
+    id: "branch-snowy", name: "Snowy bare branch", category: "branch", kind: "overhead", label: "branch",
+    zones: ["snow"], minBamboo: 0,
+    make: makeBranch, boxes: (o) => branchBoxes(o, o.top + 12),
+    draw(ctx, o) {
+      const x = o.x, tx = o.x + o.trunkX, up = o.top + 12;
+      drawTrunk(ctx, o, "#6d5a4e", "#45382f");
+      ctx.fillStyle = "#f7fbff";
+      ctx.fillRect(tx + 2, 0, 6, o.top);
+      drawCanopy(ctx, o, ["#e8eef5", "#ffffff", "#cfdbe8"]);
+      // Bare twigs pointing up (decoration)
+      ctx.strokeStyle = "#5a4a40";
+      ctx.lineWidth = 2;
+      for (const fx of [0.15, 0.4, 0.62]) {
+        const bx = x + o.w * fx;
+        ctx.beginPath();
+        ctx.moveTo(bx, up + 2);
+        ctx.lineTo(bx - 6, up - 14);
+        ctx.moveTo(bx - 3, up - 6);
+        ctx.lineTo(bx + 4, up - 16);
+        ctx.stroke();
+        ellipse(ctx, bx - 6, up - 15, 3, 1.6, 0, "#fff");
+      }
+      drawThickLimb(ctx, o, up, "#7d6a5e", "#45382f");
+      // Snow resting on top of the branch
+      ctx.beginPath();
+      ctx.moveTo(tx + 10, up - 3);
+      ctx.quadraticCurveTo(x + o.w * 0.5, up - 2, x + 2, up + 3);
+      ctx.quadraticCurveTo(x + o.w * 0.5, up + 7, tx + 10, up + 5);
+      ctx.closePath();
+      ctx.fillStyle = "#f7fbff";
+      ctx.fill();
+      ctx.strokeStyle = "#c9d8ea";
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      // Small icicles (decoration)
+      for (const fx of [0.2, 0.45, 0.7]) {
+        const ix = x + o.w * fx;
+        ctx.beginPath();
+        ctx.moveTo(ix - 2.5, o.bottom - 2);
+        ctx.lineTo(ix + 2.5, o.bottom - 2);
+        ctx.lineTo(ix, o.bottom + 5);
+        ctx.closePath();
+        ctx.fillStyle = "rgba(200,230,255,0.9)";
+        ctx.fill();
+      }
+    },
+  },
+  {
+    id: "branch-fruit", name: "Fruit branch", category: "branch", kind: "overhead", label: "branch",
+    zones: ["autumn", "desert"], minBamboo: 0,
+    make(o) { makeBranch(o); o.fruit = choose(["peach", "orange"]); },
+    boxes: (o) => branchBoxes(o),
+    draw(ctx, o) {
+      drawTrunk(ctx, o);
+      drawCanopy(ctx, o, ["#2f6b2a", "#3c7f33"]);
+      drawLimb(ctx, o);
+      for (const lx of hangPoints(o, 6)) ellipse(ctx, lx + 6, o.top + 18, 7, 3.5, 0.5, "#4fa53e", "#2a6324", 1);
+      for (const lx of hangPoints(o, 5)) {
+        const r = 8, cy = o.bottom - r;
+        ctx.beginPath();
+        ctx.moveTo(lx, o.top + 16);
+        ctx.lineTo(lx, cy - r + 1);
+        ctx.strokeStyle = "#5a3a22";
+        ctx.lineWidth = 1.4;
+        ctx.stroke();
+        if (o.fruit === "peach") {
+          ellipse(ctx, lx, cy, r, r, 0, "#ffb07a", "#c46a3a", 1.4);
+          ellipse(ctx, lx + 3, cy + 1, r * 0.45, r * 0.5, 0, "rgba(255,90,90,0.45)");
+          ctx.beginPath();
+          ctx.moveTo(lx, cy - r + 2);
+          ctx.quadraticCurveTo(lx - 3, cy, lx, cy + r - 2);
+          ctx.strokeStyle = "rgba(180,90,60,0.6)";
+          ctx.stroke();
+        } else {
+          ellipse(ctx, lx, cy, r, r, 0, "#ff9f1a", "#c46a00", 1.4);
+          ellipse(ctx, lx - 2.5, cy - 2.5, 2.2, 1.6, 0, "rgba(255,255,255,0.5)");
+        }
+      }
+    },
+  },
+  {
+    id: "branch-spooky", name: "Spooky branch with sleepy owl", category: "branch", kind: "overhead", label: "branch",
+    zones: ["autumn", "volcano"], minBamboo: 0,
+    make(o) { makeBranch(o); o.owlX = o.w * 0.35; },
+    boxes: (o) => [
+      ...branchBoxes(o, o.top + 18),
+      { x: o.owlX - 11, y: o.top - 10, w: 22, h: 30 }, // the owl
+    ],
+    draw(ctx, o, t) {
+      const x = o.x, tx = o.x + o.trunkX, up = o.top + 18;
+      drawTrunk(ctx, o, "#7d7a80", "#4e4b52");
+      // Dead twigs at the top instead of leaves
+      ctx.strokeStyle = "#5e5b63";
+      ctx.lineWidth = 2.5;
+      for (let i = 0; i < 5; i++) {
+        const sx = tx + 11;
+        ctx.beginPath();
+        ctx.moveTo(sx, 20 + i * 10);
+        ctx.quadraticCurveTo(sx - 20 - i * 6, 10 + i * 8, sx - 30 - i * 10, 4 + i * 12);
+        ctx.stroke();
+      }
+      drawThickLimb(ctx, o, up, "#8a8790", "#4e4b52");
+      // Knots and a curly twig
+      ellipse(ctx, x + o.w * 0.6, (up + o.bottom) / 2, 4, 3, 0, "#5e5b63");
+      ellipse(ctx, x + o.w * 0.15, (up + o.bottom) / 2 + 2, 3, 2.5, 0, "#5e5b63");
+      ctx.beginPath();
+      ctx.moveTo(x + 10, up + 4);
+      ctx.bezierCurveTo(x - 6, up - 4, x - 6, up - 16, x + 4, up - 14);
+      ctx.strokeStyle = "#6d6a72";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      // Sleepy owl sitting on the branch
+      const ox = x + o.owlX, oy = o.top + 6;
+      ctx.beginPath();
+      ctx.moveTo(ox - 9, oy - 9); ctx.lineTo(ox - 7, oy - 18); ctx.lineTo(ox - 3, oy - 11);
+      ctx.moveTo(ox + 9, oy - 9); ctx.lineTo(ox + 7, oy - 18); ctx.lineTo(ox + 3, oy - 11);
+      ctx.fillStyle = "#7a5b3d";
+      ctx.fill();
+      ellipse(ctx, ox, oy, 11, 14, 0, "#8b6b4a", "#5a4228", 1.5);
+      ellipse(ctx, ox, oy + 4, 7, 8, 0, "#d9c3a0");
+      ellipse(ctx, ox - 4.5, oy - 4, 4.5, 4, 0, "#efe2c8");
+      ellipse(ctx, ox + 4.5, oy - 4, 4.5, 4, 0, "#efe2c8");
+      ctx.strokeStyle = "#3a2a1a";
+      ctx.lineWidth = 1.3;
+      for (const ex of [ox - 4.5, ox + 4.5]) {
+        ctx.beginPath();
+        ctx.arc(ex, oy - 5, 2.4, 0.2, Math.PI - 0.2); // closed sleepy eyes
+        ctx.stroke();
+      }
+      ctx.beginPath();
+      ctx.moveTo(ox - 1.5, oy - 1); ctx.lineTo(ox + 1.5, oy - 1); ctx.lineTo(ox, oy + 2);
+      ctx.fillStyle = "#e0a030";
+      ctx.fill();
+      ellipse(ctx, ox - 4, oy + 13, 2.5, 1.5, 0, "#e0a030");
+      ellipse(ctx, ox + 4, oy + 13, 2.5, 1.5, 0, "#e0a030");
+      // Floating "z" (decoration)
+      const zt = (t * 0.6) % 1;
+      ctx.globalAlpha = 1 - zt;
+      drawText(ctx, "z", ox + 12 + zt * 8, oy - 16 - zt * 14, 10 + zt * 4, "#ffffff", { stroke: "#4e4b52", strokeWidth: 3 });
+      ctx.globalAlpha = 1;
+    },
+  },
+
+  /* ===== New ground hazards (jump over) ===== */
+  {
+    id: "log", name: "Fallen log", category: "log", kind: "ground", label: "log",
+    zones: ["spring", "autumn", "snow"], minBamboo: 5,
+    make(o) { o.w = randInt(52, 62); o.h = 26; },
+    boxes: groundBox,
+    draw(ctx, o) {
+      const gy = CONFIG.GROUND_Y, x = o.x, w = o.w, h = o.h;
+      const g = ctx.createLinearGradient(0, gy - h, 0, gy);
+      g.addColorStop(0, "#a5743f");
+      g.addColorStop(1, "#5e3b1d");
+      roundRectPath(ctx, x, gy - h, w - 6, h, 9);
+      ctx.fillStyle = g;
+      ctx.fill();
+      ctx.strokeStyle = "#3e2611";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      // Bark lines
+      ctx.lineWidth = 1.2;
+      for (let bx = x + 8; bx < x + w - 18; bx += 11) {
+        ctx.beginPath();
+        ctx.moveTo(bx, gy - h + 5);
+        ctx.quadraticCurveTo(bx + 5, gy - h / 2, bx + 2, gy - 5);
+        ctx.stroke();
+      }
+      // Cut end with tree rings
+      ellipse(ctx, x + w - 7, gy - h / 2, 7, h / 2, 0, "#e3c08d", "#3e2611", 2);
+      ellipse(ctx, x + w - 7, gy - h / 2, 4.5, h * 0.33, 0, null, "#b98a55", 1.2);
+      ellipse(ctx, x + w - 7, gy - h / 2, 2.2, h * 0.16, 0, null, "#b98a55", 1.2);
+    },
+  },
+  {
+    id: "bush", name: "Thorny bush", category: "bush", kind: "ground", label: "thorny bush",
+    zones: ["spring", "autumn", "desert"], minBamboo: 5,
+    make(o) { o.w = 46; o.h = randInt(30, 34); },
+    boxes: groundBox,
+    draw(ctx, o) {
+      const gy = CONFIG.GROUND_Y, cx = o.x + o.w / 2, h = o.h;
+      const blobs = [[-11, h * 0.35, h * 0.33], [11, h * 0.35, h * 0.33], [0, h * 0.55, h * 0.4]];
+      // Thorns first, so the leaves cover their bases
+      ctx.fillStyle = "#f5e6c4";
+      ctx.strokeStyle = "#6b5535";
+      ctx.lineWidth = 1;
+      for (const [dx, up, r] of blobs) {
+        for (let a = Math.PI * 0.95; a <= Math.PI * 2.05; a += 0.42) {
+          const bx = cx + dx + Math.cos(a) * r, by = gy - up + Math.sin(a) * r;
+          const tx = cx + dx + Math.cos(a) * (r + 5), ty = gy - up + Math.sin(a) * (r + 5);
+          const px = -Math.sin(a) * 2.4, py = Math.cos(a) * 2.4;
+          ctx.beginPath();
+          ctx.moveTo(bx + px, by + py);
+          ctx.lineTo(tx, ty);
+          ctx.lineTo(bx - px, by - py);
+          ctx.closePath();
+          ctx.fill();
+          ctx.stroke();
+        }
+      }
+      for (const [dx, up, r] of blobs) ellipse(ctx, cx + dx, gy - up, r, r, 0, "#3d8a3a", "#24572a", 2);
+      for (const [dx, up, r] of blobs) ellipse(ctx, cx + dx - r * 0.3, gy - up - r * 0.35, r * 0.3, r * 0.2, 0, "rgba(255,255,255,0.18)");
+      ellipse(ctx, cx - 6, gy - h * 0.4, 2, 2, 0, "#c0392b");
+      ellipse(ctx, cx + 8, gy - h * 0.55, 2, 2, 0, "#c0392b");
+    },
+  },
+  {
+    id: "cactus", name: "Cactus", category: "cactus", kind: "ground", label: "cactus",
+    zones: ["desert"], minBamboo: 5,
+    make(o) { o.w = 32; o.h = 36; },
+    boxes: (o) => [
+      { x: 10, y: CONFIG.GROUND_Y - 36, w: 12, h: 36 }, // main column
+      { x: 0, y: CONFIG.GROUND_Y - 30, w: 32, h: 18 },  // the two arms
+    ],
+    draw(ctx, o) {
+      const gy = CONFIG.GROUND_Y, x = o.x;
+      const parts = [
+        [x + 10, gy - 35, 12, 35, 6], [x + 1, gy - 28, 7, 15, 3.5], [x + 1, gy - 17, 13, 6, 3],
+        [x + 24, gy - 30, 7, 15, 3.5], [x + 18, gy - 20, 13, 6, 3],
+      ];
+      for (const [px, py, pw, ph, r] of parts) {
+        roundRectPath(ctx, px, py, pw, ph, r);
+        ctx.fillStyle = "#4f9d4a";
+        ctx.fill();
+        ctx.strokeStyle = "#2d6a2b";
+        ctx.lineWidth = 1.8;
+        ctx.stroke();
+      }
+      ctx.strokeStyle = "rgba(40,100,40,0.7)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x + 16, gy - 32); ctx.lineTo(x + 16, gy - 2);
+      ctx.stroke();
+      ctx.strokeStyle = "#f4f0dc";
+      for (const [sx, sy, d] of [[x + 10, gy - 26, -1], [x + 22, gy - 14, 1], [x + 10, gy - 8, -1], [x + 22, gy - 28, 1], [x + 1, gy - 24, -1], [x + 31, gy - 26, 1]]) {
+        ctx.beginPath();
+        ctx.moveTo(sx, sy); ctx.lineTo(sx + d * 3, sy - 1.5);
+        ctx.stroke();
+      }
+      for (let i = 0; i < 5; i++) {
+        const a = (i * Math.PI * 2) / 5;
+        ellipse(ctx, x + 16 + Math.cos(a) * 2.2, gy - 35 + Math.sin(a) * 1.6, 1.8, 1.5, 0, "#ff7eb3");
+      }
+    },
+  },
+  {
+    id: "lava", name: "Lava pit", category: "lava", kind: "ground", label: "lava pit",
+    message: "stepped in the lava",
+    zones: ["desert", "volcano"], minBamboo: 18,
+    make(o) {
+      o.w = Math.round(rand(CONFIG.LAVA_MIN_WIDTH, CONFIG.LAVA_MAX_WIDTH));
+      o.h = 10;
+      o.seed = Math.random();
+    },
+    // The pool surface is set into the ground; the glow and sparks are decoration
+    boxes: (o) => [{ x: 4, y: CONFIG.GROUND_Y - 10, w: o.w - 8, h: 30 }],
+    draw(ctx, o, t) {
+      const gy = CONFIG.GROUND_Y, x = o.x, w = o.w;
+      const glow = ctx.createRadialGradient(x + w / 2, gy, 4, x + w / 2, gy, w * 0.75);
+      glow.addColorStop(0, `rgba(255,140,40,${0.4 + 0.1 * Math.sin(t * 4)})`);
+      glow.addColorStop(1, "rgba(255,140,40,0)");
+      ctx.fillStyle = glow;
+      ctx.fillRect(x - w * 0.3, gy - w * 0.6, w * 1.6, w * 0.9);
+      roundRectPath(ctx, x, gy - 4, w, 28, 10);
+      ctx.fillStyle = "#3b2620";
+      ctx.fill();
+      const lava = ctx.createLinearGradient(0, gy - 2, 0, gy + 18);
+      lava.addColorStop(0, "#fff27a");
+      lava.addColorStop(0.35, "#ff9a1f");
+      lava.addColorStop(1, "#d8361a");
+      roundRectPath(ctx, x + 4, gy - 2, w - 8, 20, 8);
+      ctx.fillStyle = lava;
+      ctx.fill();
+      // Moving surface ripple
+      ctx.beginPath();
+      for (let px = x + 8; px <= x + w - 8; px += 4) ctx.lineTo(px, gy + 2 + Math.sin(px * 0.2 + t * 4) * 1.5);
+      ctx.strokeStyle = "#fff6b0";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      // Bubbles grow and pop
+      for (let i = 0; i < 3; i++) {
+        const p = (t * 0.9 + i * 0.37 + o.seed) % 1;
+        const bx = x + 12 + ((i * 0.37 + o.seed) % 1) * (w - 24);
+        if (p < 0.85) ellipse(ctx, bx, gy + 6 - p * 6, 2 + p * 4, 2 + p * 4, 0, "#ffb347", "#ffe08a", 1);
+        else ellipse(ctx, bx, gy, 7, 3, 0, null, "rgba(255,230,140,0.8)", 1);
+      }
+      // Rising sparks
+      for (let i = 0; i < 5; i++) {
+        const p = (t * 0.7 + i * 0.2 + o.seed) % 1;
+        const sx = x + 10 + ((i * 0.53 + o.seed) % 1) * (w - 20) + Math.sin(p * 6 + i) * 4;
+        ctx.globalAlpha = 1 - p;
+        ellipse(ctx, sx, gy - p * 34, 1.8, 1.8, 0, "#ffcf4a");
+      }
+      ctx.globalAlpha = 1;
+      ellipse(ctx, x + 3, gy - 2, 5, 3.5, 0, "#4a3028");
+      ellipse(ctx, x + w - 4, gy - 2, 6, 3.5, 0, "#4a3028");
+    },
+  },
+
+  /* ===== New overhead hazards (duck under) ===== */
+  {
+    id: "beehive", name: "Hanging beehive", category: "beehive", kind: "overhead", label: "beehive",
+    zones: ["spring", "autumn", "desert"], minBamboo: 12,
+    make(o) {
+      o.w = 40;
+      o.bottom = CONFIG.GROUND_Y - CONFIG.BRANCH_CLEARANCE;
+      o.hiveTop = o.bottom - 44;
+    },
+    boxes: (o) => [{ x: 3, y: o.hiveTop, w: 34, h: 44 }], // the hive only; vine and bees are decoration
+    draw(ctx, o, t) {
+      const cx = o.x + 20, top = o.hiveTop;
+      ctx.beginPath();
+      ctx.moveTo(cx, -5);
+      for (let y = 0; y <= top + 4; y += 8) ctx.lineTo(cx + Math.sin(y * 0.08) * 3, y);
+      ctx.strokeStyle = "#4f7d2a";
+      ctx.lineWidth = 3;
+      ctx.stroke();
+      for (let y = 40; y < top - 10; y += 40) ellipse(ctx, cx + 6, y, 6, 3, -0.5, "#5cae43");
+      ellipse(ctx, cx, 4, 30, 14, 0, "#3c7f33");
+      // Hive bands, bottom first so upper bands overlap them
+      const rows = [[28, 33], [34, 25], [32, 16], [24, 8], [14, 0]];
+      for (const [rw, ry] of rows) ellipse(ctx, cx, top + ry + 5.5, rw / 2, 5.6, 0, "#f4c542", "#b8860b", 1.5);
+      ellipse(ctx, cx, top + 34, 4, 3.5, 0, "#4a2c0a");
+      for (let i = 0; i < 2; i++) {
+        const a = t * 4 + i * Math.PI;
+        drawBee(ctx, cx + Math.cos(a) * 27, top + 22 + Math.sin(a * 1.6) * 14, Math.sin(a) > 0 ? -1 : 1, t);
+      }
+    },
+  },
+  {
+    id: "bird", name: "Low-flying bird", category: "bird", kind: "overhead", label: "bird",
+    zones: ALL_ZONES, minBamboo: 24,
+    movesFaster: true, // flies toward the panda at BIRD_EXTRA_SPEED faster than the ground
+    make(o) {
+      o.w = 46;
+      o.bodyH = 28;
+      // Bobs up and down by 3px; even at its lowest it stays duckable.
+      o.baseBottom = CONFIG.GROUND_Y - CONFIG.BRANCH_CLEARANCE - 3;
+      o.age = rand(0, 3);
+      o.color = choose(["#4d96ff", "#ff6b6b", "#9b59b6"]);
+    },
+    boxes(o) {
+      const bob = Math.sin(o.age * 4) * 3;
+      return [{ x: 4, y: o.baseBottom - o.bodyH + bob, w: o.w - 8, h: o.bodyH }];
+    },
+    draw(ctx, o, t) {
+      const x = o.x, by = o.baseBottom + Math.sin(o.age * 4) * 3;
+      ellipse(ctx, x + 23, CONFIG.GROUND_Y + 2, 14, 3, 0, "rgba(0,0,0,0.15)");
+      // Tail
+      ctx.beginPath();
+      ctx.moveTo(x + 36, by - 14); ctx.lineTo(x + 47, by - 20); ctx.lineTo(x + 46, by - 8);
+      ctx.closePath();
+      ctx.fillStyle = o.color;
+      ctx.fill();
+      ctx.strokeStyle = "rgba(0,0,0,0.4)";
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+      // Body, belly, head
+      ellipse(ctx, x + 25, by - 13, 15, 11, 0, o.color, "rgba(0,0,0,0.45)", 1.5);
+      ellipse(ctx, x + 22, by - 8, 9, 5.5, 0, "rgba(255,255,255,0.6)");
+      ellipse(ctx, x + 11, by - 17, 8, 8, 0, o.color, "rgba(0,0,0,0.45)", 1.5);
+      ellipse(ctx, x + 9, by - 19, 2.8, 2.8, 0, "#fff");
+      ellipse(ctx, x + 8.3, by - 19, 1.5, 1.5, 0, "#111");
+      ellipse(ctx, x + 12, by - 14, 2, 1.3, 0, "rgba(255,120,140,0.6)");
+      // Beak (points at the panda)
+      ctx.beginPath();
+      ctx.moveTo(x + 4, by - 18); ctx.lineTo(x - 3, by - 15); ctx.lineTo(x + 4, by - 13);
+      ctx.closePath();
+      ctx.fillStyle = "#ffb020";
+      ctx.fill();
+      // Flapping wing (always above the body, decoration)
+      ctx.save();
+      ctx.translate(x + 26, by - 17);
+      ctx.rotate(Math.sin(t * 16 + o.age) * 0.9 - 0.3);
+      ellipse(ctx, 0, -9, 6, 11, 0, o.color, "rgba(0,0,0,0.5)", 1.3);
+      ellipse(ctx, 0, -12, 3, 5, 0, "rgba(255,255,255,0.3)");
+      ctx.restore();
+    },
+  },
+];
+
+const OBSTACLE_BY_ID = Object.fromEntries(OBSTACLE_TYPES.map((t) => [t.id, t]));
+
+// How often each category is picked compared to the others (styles inside a
+// category share its weight equally).
+const CATEGORY_WEIGHTS = { rock: 2, branch: 2, log: 1, bush: 1, cactus: 1.2, lava: 1.2, beehive: 1, bird: 1 };
+
+class Obstacle {
+  // type: a registry entry, an id like "rock-mossy", or a category like "rock"
+  // (which picks a random style from that category).
+  constructor(type, x) {
+    if (typeof type === "string") {
+      type = OBSTACLE_BY_ID[type] || choose(OBSTACLE_TYPES.filter((t) => t.category === type));
+    }
+    this.type = type;
+    this.kind = type.kind;       // "ground" or "overhead"
+    this.category = type.category;
+    this.label = type.label;
+    this.x = x;
+    this.age = 0;
+    this.hasHit = false;         // each obstacle can hurt the panda only once
+    type.make(this);
   }
 
   update(dt, speed) {
-    this.x -= speed * dt;
+    this.age += dt;
+    const extra = this.type.movesFaster ? CONFIG.BIRD_EXTRA_SPEED : 0;
+    this.x -= (speed + extra) * dt;
   }
 
   get offscreen() {
-    return this.x + this.w < -40;
+    return this.x + this.w < -60;
   }
 
-  // Returns a list of hitbox rectangles (already inset).
+  // The solid parts, shrunk by HITBOX_INSET, in screen coordinates.
   getHitboxes() {
-    if (this.kind === "rock") {
-      return [insetBox(this.x, this.y, this.w, this.h)];
-    }
-    return [
-      insetBox(this.x, this.top, this.w, CONFIG.BRANCH_THICKNESS),  // leafy branch
-      insetBox(this.trunkX, 0, this.trunkW, this.top + 12),         // trunk above it
-    ];
+    return this.type.boxes(this).map((b) => insetBox(this.x + b.x, b.y, b.w, b.h));
   }
 
-  draw(ctx) {
-    if (this.kind === "rock") this.drawRock(ctx);
-    else this.drawBranch(ctx);
-  }
-
-  drawRock(ctx) {
-    ctx.save();
-    ctx.translate(this.x, CONFIG.GROUND_Y);
-    ctx.beginPath();
-    for (const p of this.points) ctx.lineTo(p.x, p.y);
-    ctx.closePath();
-    const g = ctx.createLinearGradient(0, -this.h, 0, 0);
-    g.addColorStop(0, "#b4b8be");
-    g.addColorStop(1, "#5e646c");
-    ctx.fillStyle = g;
-    ctx.fill();
-    ctx.lineWidth = 2;
-    ctx.lineJoin = "round";
-    ctx.strokeStyle = "#3e4249";
-    ctx.stroke();
-    // Highlight and a crack for detail
-    ellipse(ctx, this.w * 0.35, -this.h * 0.68, this.w * 0.14, this.h * 0.1, -0.4, "rgba(255,255,255,0.45)");
-    ctx.beginPath();
-    ctx.moveTo(this.w * 0.62, -this.h * 0.8);
-    ctx.lineTo(this.w * 0.55, -this.h * 0.5);
-    ctx.lineTo(this.w * 0.64, -this.h * 0.3);
-    ctx.lineWidth = 1.3;
-    ctx.strokeStyle = "rgba(40,40,45,0.6)";
-    ctx.stroke();
-    if (this.hasMoss) {
-      ellipse(ctx, this.w * 0.5, -this.h * 0.93, this.w * 0.18, 3, 0, "#6aa84f");
-    }
-    ctx.restore();
-  }
-
-  drawBranch(ctx) {
-    const x = this.x, w = this.w, top = this.top, bottom = this.bottom;
-    const tx = this.trunkX;
-    const rnd = seededRandom(Math.floor(this.leafSeed) + 1);
-
-    // Tree trunk coming down from the canopy at the top of the screen
-    ctx.fillStyle = "#6b4426";
-    ctx.fillRect(tx, 0, this.trunkW, top + 14);
-    ctx.strokeStyle = "#4a2e17";
-    ctx.lineWidth = 2;
-    ctx.strokeRect(tx, -2, this.trunkW, top + 16);
-    // Bark lines
-    ctx.lineWidth = 1.2;
-    for (let yy = 30; yy < top; yy += 26) {
-      ctx.beginPath();
-      ctx.moveTo(tx + 5, yy);
-      ctx.quadraticCurveTo(tx + 11, yy + 6, tx + 7, yy + 14);
-      ctx.stroke();
-    }
-
-    // Canopy of leaves at the very top
-    for (let i = 0; i < 7; i++) {
-      const cx = x - 20 + (i / 6) * (w + 40);
-      ellipse(ctx, cx, 6 + rnd() * 10, 22 + rnd() * 8, 16 + rnd() * 6, 0, i % 2 ? "#2f6b2a" : "#3c7f33");
-    }
-
-    // The branch itself: a thick, slightly drooping limb from the trunk
-    ctx.beginPath();
-    ctx.moveTo(tx + 8, top + 2);
-    ctx.quadraticCurveTo(x + w * 0.45, top + 6, x + 2, top + 12);
-    ctx.lineTo(x + 4, top + 18);
-    ctx.quadraticCurveTo(x + w * 0.45, top + 16, tx + 8, top + 22);
-    ctx.closePath();
-    ctx.fillStyle = "#7a4e2c";
-    ctx.fill();
-    ctx.strokeStyle = "#4a2e17";
-    ctx.lineWidth = 2;
-    ctx.stroke();
-    // Small twig
-    ctx.beginPath();
-    ctx.moveTo(x + w * 0.4, top + 10);
-    ctx.lineTo(x + w * 0.3, top + 1);
-    ctx.lineWidth = 3;
-    ctx.stroke();
-
-    // Leaves hanging down (the lowest point is exactly `bottom`)
-    const leafCount = 6;
-    for (let i = 0; i < leafCount; i++) {
-      const lx = x + 8 + (i / (leafCount - 1)) * (w - 22);
-      const start = top + 14;
-      const len = i % 2 === 0 ? bottom - start : (bottom - start) * 0.75;
-      const tilt = (rnd() - 0.5) * 0.4;
-      ellipse(ctx, lx, start + len / 2, 7, len / 2, tilt, i % 2 ? "#4f9a3a" : "#5cae43", "#2f6b2a", 1.2);
-      // Leaf vein
-      ctx.beginPath();
-      ctx.moveTo(lx, start + 2);
-      ctx.lineTo(lx, start + len - 3);
-      ctx.strokeStyle = "rgba(40,90,30,0.7)";
-      ctx.lineWidth = 1;
-      ctx.stroke();
-    }
-    // A couple of leaves on top of the branch
-    ellipse(ctx, x + w * 0.2, top + 4, 8, 4, -0.4, "#5cae43", "#2f6b2a", 1);
-    ellipse(ctx, x + w * 0.6, top + 2, 8, 4, 0.4, "#4f9a3a", "#2f6b2a", 1);
+  draw(ctx, t) {
+    this.type.draw(ctx, this, t);
   }
 }
 
@@ -1048,12 +2048,114 @@ class Bamboo {
 }
 
 
+/* ---------------------------------------------------------------------
+   Heart pickup - a rare floating heart that gives an extra life
+   --------------------------------------------------------------------- */
+class HeartPickup {
+  constructor(x, heightAboveGround) {
+    this.w = 26;
+    this.h = 24;
+    this.x = x; // left edge
+    this.y = CONFIG.GROUND_Y - heightAboveGround - this.h; // top edge
+    this.phase = rand(0, Math.PI * 2);
+  }
+
+  update(dt, speed) {
+    this.x -= speed * dt;
+    this.phase += dt * 3;
+  }
+
+  get offscreen() {
+    return this.x + this.w < -30;
+  }
+
+  getHitbox() {
+    return insetBox(this.x, this.y, this.w, this.h);
+  }
+
+  draw(ctx) {
+    const cx = this.x + this.w / 2;
+    const cy = this.y + this.h / 2 + Math.sin(this.phase) * 3;
+    // Soft pink glow
+    const g = ctx.createRadialGradient(cx, cy, 2, cx, cy, 26);
+    g.addColorStop(0, "rgba(255,180,200,0.75)");
+    g.addColorStop(1, "rgba(255,180,200,0)");
+    ctx.fillStyle = g;
+    ctx.fillRect(cx - 28, cy - 28, 56, 56);
+    const pulse = 1 + Math.sin(this.phase * 2) * 0.06;
+    drawHeart(ctx, cx, cy + 1, this.w * pulse, "#ff3b4f", "#9b1020");
+    // Twinkling sparkles circling it
+    for (let i = 0; i < 3; i++) {
+      const a = this.phase * 0.8 + (i * Math.PI * 2) / 3;
+      const s = 2 + 1.5 * Math.abs(Math.sin(this.phase * 2 + i));
+      drawStar(ctx, cx + Math.cos(a) * 19, cy + Math.sin(a) * 15, s, "#fff6b0");
+    }
+  }
+}
+
+
 /* =====================================================================
-   7. Background - parallax layers
+   7. Background - parallax layers and themed zones
    `scroll` counts how many pixels the world has moved. Each layer moves
    at a fraction of that (its parallax factor). Every layer repeats every
    800px (the screen width), so it loops without a visible seam.
+   The colors come from a zone palette (see ZONES), so the scenery can
+   fade from one zone to the next.
    ===================================================================== */
+
+// Themed zones. With ZONES_ENABLED, the zone changes every ZONE_EVERY
+// bamboo (spring -> autumn -> snow -> desert -> volcano) and obstacles are
+// drawn from that zone's set (each obstacle lists its zones).
+const ZONES = [
+  { id: "spring", name: "Spring Forest",
+    sky: ["#7cc6f2", "#cdeefc", "#f4f1d8"], sun: "#fff6c9", far: "#b4cbdc", near: "#93b6ad", mist: "#ffffff",
+    forest: "#2d7841", grassTop: "#7cc04f", grassBottom: "#5f9c3a", dirtTop: "#9b7650", dirtBottom: "#6e5136",
+    grassLine: "#4f8a2c", tuft: "#3f7d22", pebble: "#857055" },
+  { id: "autumn", name: "Autumn Woods",
+    sky: ["#f2b97c", "#fbe3c4", "#fdf1dc"], sun: "#fff1c4", far: "#d9b8a6", near: "#c48f6e", mist: "#fff4e6",
+    forest: "#8a5426", grassTop: "#c9a24a", grassBottom: "#a77d33", dirtTop: "#8a6142", dirtBottom: "#5e4029",
+    grassLine: "#8c6a25", tuft: "#7a5a1c", pebble: "#7a6248" },
+  { id: "snow", name: "Snowy Mountain",
+    sky: ["#9fb8d6", "#dde8f3", "#f3f6fa"], sun: "#ffffff", far: "#e6edf5", near: "#b8c8da", mist: "#ffffff",
+    forest: "#4b6b66", grassTop: "#f4f8fc", grassBottom: "#d4e1ee", dirtTop: "#8c8f9c", dirtBottom: "#5f6170",
+    grassLine: "#c4d4e6", tuft: "#a9bcd2", pebble: "#7c8090" },
+  { id: "desert", name: "Desert Canyon",
+    sky: ["#f6c27a", "#fbe0a8", "#fff2d0"], sun: "#fff8d8", far: "#e7a46b", near: "#c9764a", mist: "#fff1d6",
+    forest: "#76793a", grassTop: "#e8c27a", grassBottom: "#d1a35c", dirtTop: "#c08850", dirtBottom: "#8e5a32",
+    grassLine: "#b98a48", tuft: "#9a8a3a", pebble: "#9a6a40" },
+  { id: "volcano", name: "Volcano",
+    sky: ["#3b2a3f", "#7a3b3b", "#d26a3a"], sun: "#ffb36b", far: "#5a3a44", near: "#3e2a30", mist: "#c8603a",
+    forest: "#2f2a22", grassTop: "#4a3a34", grassBottom: "#2f2422", dirtTop: "#3a2a26", dirtBottom: "#1e1514",
+    grassLine: "#5a2a1c", tuft: "#6a3a24", pebble: "#5a4038" },
+];
+
+// "#rrggbb" -> [r, g, b]
+function hexToRgb(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+// Blend two zone palettes: k = 0 gives `a`, k = 1 gives `b`.
+// The result holds [r, g, b] arrays; use rgb() to turn one into a color.
+function blendPalettes(a, b, k) {
+  const out = {};
+  for (const key of Object.keys(a)) {
+    if (key === "id" || key === "name") continue;
+    const mix = (ha, hb) => {
+      const ca = hexToRgb(ha), cb = hexToRgb(hb);
+      return ca.map((v, i) => v + (cb[i] - v) * k);
+    };
+    out[key] = Array.isArray(a[key]) ? a[key].map((c, i) => mix(c, b[key][i])) : mix(a[key], b[key]);
+  }
+  return out;
+}
+
+// [r, g, b] (+ optional alpha, + optional brightness offset) -> CSS color
+function rgb(c, alpha = 1, add = 0) {
+  const [r, g, b] = c.map((v) => Math.max(0, Math.min(255, Math.round(v + add))));
+  return alpha === 1 ? `rgb(${r},${g},${b})` : `rgba(${r},${g},${b},${alpha})`;
+}
+
 class Background {
   constructor() {
     this.scroll = 0;
@@ -1121,25 +2223,26 @@ class Background {
     ctx.fill();
   }
 
-  draw(ctx) {
+  // pal: a palette from blendPalettes()
+  draw(ctx, pal) {
     const W = CONFIG.WIDTH, H = CONFIG.HEIGHT, GY = CONFIG.GROUND_Y;
 
     // --- Layer 1 (far, slowest): sky, sun and misty mountains ---
     const sky = ctx.createLinearGradient(0, 0, 0, GY);
-    sky.addColorStop(0, "#7cc6f2");
-    sky.addColorStop(0.6, "#cdeefc");
-    sky.addColorStop(1, "#f4f1d8");
+    sky.addColorStop(0, rgb(pal.sky[0]));
+    sky.addColorStop(0.6, rgb(pal.sky[1]));
+    sky.addColorStop(1, rgb(pal.sky[2]));
     ctx.fillStyle = sky;
     ctx.fillRect(0, 0, W, H);
-    ellipse(ctx, 640, 75, 46, 46, 0, "rgba(255,250,220,0.5)");
-    ellipse(ctx, 640, 75, 32, 32, 0, "#fff6c9");
+    ellipse(ctx, 640, 75, 46, 46, 0, rgb(pal.sun, 0.45));
+    ellipse(ctx, 640, 75, 32, 32, 0, rgb(pal.sun));
 
-    this.drawMountains(ctx, this.farWaves, CONFIG.PARALLAX_FAR, 240, "#b4cbdc");
-    this.drawMountains(ctx, this.nearWaves, CONFIG.PARALLAX_MOUNTAINS, 275, "#93b6ad");
+    this.drawMountains(ctx, this.farWaves, CONFIG.PARALLAX_FAR, 240, rgb(pal.far));
+    this.drawMountains(ctx, this.nearWaves, CONFIG.PARALLAX_MOUNTAINS, 275, rgb(pal.near));
     // Mist band
     const mist = ctx.createLinearGradient(0, 200, 0, 300);
-    mist.addColorStop(0, "rgba(255,255,255,0)");
-    mist.addColorStop(1, "rgba(255,255,255,0.55)");
+    mist.addColorStop(0, rgb(pal.mist, 0));
+    mist.addColorStop(1, rgb(pal.mist, 0.55));
     ctx.fillStyle = mist;
     ctx.fillRect(0, 200, W, 100);
 
@@ -1147,8 +2250,7 @@ class Background {
     const fOff = this.layerOffset(CONFIG.PARALLAX_FOREST);
     ctx.globalAlpha = 0.6; // faded so it reads as "far away" and the bamboo pickups stand out
     for (const s of this.stalks) {
-      const light = Math.floor(95 + s.shade * 40);
-      const color = `rgb(${light - 50}, ${light + 25}, ${light - 30})`;
+      const color = rgb(pal.forest, 1, s.shade * 40);
       this.forEachLooped(s.x, fOff, (sx) => {
         if (sx < -40 || sx > W + 40) return;
         ctx.fillStyle = color;
@@ -1165,23 +2267,24 @@ class Background {
 
     // --- Layer 3 (near): ground strip, same speed as obstacles ---
     const ground = ctx.createLinearGradient(0, GY, 0, H);
-    ground.addColorStop(0, "#7cc04f");
-    ground.addColorStop(0.18, "#5f9c3a");
-    ground.addColorStop(0.2, "#9b7650");
-    ground.addColorStop(1, "#6e5136");
+    ground.addColorStop(0, rgb(pal.grassTop));
+    ground.addColorStop(0.18, rgb(pal.grassBottom));
+    ground.addColorStop(0.2, rgb(pal.dirtTop));
+    ground.addColorStop(1, rgb(pal.dirtBottom));
     ctx.fillStyle = ground;
     ctx.fillRect(0, GY, W, H - GY);
-    ctx.fillStyle = "#4f8a2c";
+    ctx.fillStyle = rgb(pal.grassLine);
     ctx.fillRect(0, GY, W, 3);
 
     const gOff = this.layerOffset(CONFIG.PARALLAX_GROUND);
+    const pebble = rgb(pal.pebble);
     for (const p of this.pebbles) {
       this.forEachLooped(p.x, gOff, (sx) => {
-        ellipse(ctx, sx, p.y, p.r * 1.3, p.r, 0, "#857055");
+        ellipse(ctx, sx, p.y, p.r * 1.3, p.r, 0, pebble);
         ellipse(ctx, sx - p.r * 0.3, p.y - p.r * 0.3, p.r * 0.4, p.r * 0.3, 0, "rgba(255,255,255,0.25)");
       });
     }
-    ctx.strokeStyle = "#3f7d22";
+    ctx.strokeStyle = rgb(pal.tuft);
     ctx.lineWidth = 2;
     ctx.lineCap = "round";
     for (const t of this.tufts) {
@@ -1214,6 +2317,8 @@ class Game {
     this.time = 0;          // total time, used for animations
     this.keys = new Set();  // keys currently held down
     this.fps = 60;
+    this.showcaseIndex = 0; // which item the "O" gallery is showing
+    this.showcaseItem = null;
     this.resetRun();
   }
 
@@ -1224,15 +2329,24 @@ class Game {
     this.bamboos = [];
     this.particles = [];         // "+1" pops and sparkles
     this.confetti = [];
-    this.hitBy = null;           // "rock" or "branch" after a crash
+    this.pickups = [];           // heart pickups on screen
+    this.hitBy = null;           // label of the obstacle that ended the run
+    this.hitMessage = "";        // e.g. "bonked into a rock"
+    this.lastTypeId = null;      // never spawn the same style twice in a row
+    this.zoneIndex = 0;          // current zone (index into ZONES)
+    this.zoneFrom = 0;           // zone we are fading from
+    this.zoneBlend = 1;          // 0..1 progress of that fade
     this.endTime = 0;            // when the run ended
     this.lives = CONFIG.START_LIVES;
+    this.heartSlots = CONFIG.START_LIVES; // hearts shown in the HUD (grows when a 3rd is earned)
     this.heartLostAt = [];       // heartLostAt[i] = time heart i was lost (for its animation)
+    this.heartGainedAt = [];     // heartGainedAt[i] = time heart i was gained (pop animation)
+    this.bambooAtLastHeart = 0;  // bamboo count when the last heart pickup appeared
     this.invincibleTimer = 0;    // > 0 while the panda flashes and can't be hurt
     this.panda.reset();
     // Distance (px) still to scroll before the next obstacle appears
     this.distToNextObstacle = CONFIG.START_SPEED * CONFIG.FIRST_OBSTACLE_DELAY;
-    this.nextObstacleKind = this.pickObstacleKind();
+    this.nextObstacleType = this.pickObstacleType();
   }
 
   // Current scroll speed: a small bump every SPEED_STEP_EVERY bamboo.
@@ -1243,8 +2357,37 @@ class Game {
     return Math.min(CONFIG.MAX_SPEED, CONFIG.START_SPEED + this.speedLevel * CONFIG.SPEED_STEP);
   }
 
-  pickObstacleKind() {
-    return Math.random() < CONFIG.BRANCH_CHANCE ? "branch" : "rock";
+  // The current colors: a blend between the previous and the current zone.
+  get palette() {
+    return blendPalettes(ZONES[this.zoneFrom], ZONES[this.zoneIndex], this.zoneBlend);
+  }
+
+  // Choose the next obstacle style from the registry:
+  //  - only styles unlocked by the bamboo count (minBamboo)
+  //  - only styles of the current zone (when zones are on)
+  //  - ground or overhead by OVERHEAD_CHANCE
+  //  - a category by CATEGORY_WEIGHTS, then a style in it
+  //  - never the same style twice in a row
+  pickObstacleType() {
+    const zone = ZONES[this.zoneIndex].id;
+    const unlocked = OBSTACLE_TYPES.filter((t) => this.count >= t.minBamboo);
+    let pool = CONFIG.ZONES_ENABLED ? unlocked.filter((t) => t.zones.includes(zone)) : unlocked;
+    if (!pool.length) pool = unlocked;
+    const wantKind = Math.random() < CONFIG.OVERHEAD_CHANCE ? "overhead" : "ground";
+    let choices = pool.filter((t) => t.kind === wantKind);
+    if (!choices.length) choices = pool;
+    if (choices.length > 1) choices = choices.filter((t) => t.id !== this.lastTypeId);
+    const cats = [...new Set(choices.map((t) => t.category))];
+    const weight = (c) => CATEGORY_WEIGHTS[c] ?? 1;
+    let r = Math.random() * cats.reduce((sum, c) => sum + weight(c), 0);
+    let cat = cats[cats.length - 1];
+    for (const c of cats) {
+      r -= weight(c);
+      if (r <= 0) { cat = c; break; }
+    }
+    const type = choose(choices.filter((t) => t.category === cat));
+    this.lastTypeId = type.id;
+    return type;
   }
 
   /* ------------------------- State changes ------------------------- */
@@ -1275,9 +2418,10 @@ class Game {
     }
   }
 
-  gameOver(kind) {
+  gameOver(obstacle) {
     this.state = "gameover";
-    this.hitBy = kind;
+    this.hitBy = obstacle.label;
+    this.hitMessage = obstacle.type.message || `bonked into a ${obstacle.label}`;
     this.endTime = this.time;
     this.bestScore = Math.max(this.bestScore, this.count);
     this.panda.wantsDuck = false;
@@ -1319,6 +2463,11 @@ class Game {
 
     if (key === "h" || key === "H") { this.debug = !this.debug; return; }
     if (key === "m" || key === "M") { this.sound.toggleMute(); return; }
+    // O: debug gallery of every obstacle style (not during active play)
+    if ((key === "o" || key === "O") && this.state !== "playing") {
+      this.showcaseStep(e.shiftKey ? -1 : 1);
+      return;
+    }
 
     switch (this.state) {
       case "title":
@@ -1336,6 +2485,35 @@ class Game {
       case "win":
         if (isStartKey && this.time - this.endTime > CONFIG.RESTART_DELAY) this.start();
         break;
+      case "showcase":
+        if (key === "Escape" || isStartKey) {
+          this.resetRun();
+          this.state = "title";
+        }
+        break;
+    }
+  }
+
+  // Step through the gallery: every registry entry, then the heart pickup.
+  showcaseStep(dir) {
+    const list = [...OBSTACLE_TYPES, "heart"];
+    if (this.state !== "showcase") {
+      this.sound.music.stop();
+      this.state = "showcase";
+      this.showcaseIndex = dir > 0 ? 0 : list.length - 1;
+    } else {
+      this.showcaseIndex = (this.showcaseIndex + dir + list.length) % list.length;
+    }
+    this.panda.reset();
+    const entry = list[this.showcaseIndex];
+    if (entry === "heart") {
+      this.showcaseItem = new HeartPickup(420 - 13, CONFIG.BAMBOO_MID_HEIGHT);
+      this.showcaseZone = 0;
+    } else {
+      const o = new Obstacle(entry, 0);
+      o.x = 420 - o.w / 2;
+      this.showcaseItem = o;
+      this.showcaseZone = Math.max(0, ZONES.findIndex((z) => z.id === entry.zones[0]));
     }
   }
 
@@ -1357,36 +2535,59 @@ class Game {
     // Spawn just off the right edge. distToNextObstacle is <= 0 here; adding
     // it keeps spacing exact even if we overshot a little this frame.
     const x = CONFIG.WIDTH + 20 + this.distToNextObstacle;
-    const kind = this.nextObstacleKind;
-    const obs = new Obstacle(kind, x);
+    const type = this.nextObstacleType;
+    const obs = new Obstacle(type, x);
     this.obstacles.push(obs);
 
     // Decide what comes next and how far away it is.
-    const next = this.pickObstacleKind();
-    this.nextObstacleKind = next;
+    const next = this.pickObstacleType();
+    this.nextObstacleType = next;
     const randomPart = Math.max(CONFIG.RANDOM_GAP_MIN, CONFIG.RANDOM_GAP - this.speedLevel * CONFIG.RANDOM_GAP_SHRINK);
     let gapTime = CONFIG.MIN_OBSTACLE_GAP + rand(0, randomPart);
-    if (next !== kind) gapTime += CONFIG.MIXED_GAP_BONUS; // rock<->branch needs a bit more time
+    if (next.kind !== type.kind) gapTime += CONFIG.MIXED_GAP_BONUS; // jump<->duck needs a bit more time
     // Convert time to pixels. We use the speed one step faster than now, in
     // case the player speeds up before reaching the next obstacle; that way
     // the minimum gap in seconds is still respected.
     const safeSpeed = Math.min(CONFIG.MAX_SPEED, this.speed + CONFIG.SPEED_STEP);
-    const gapPx = obs.w + gapTime * safeSpeed;
+    let gapPx = obs.w + gapTime * safeSpeed;
+    // A bird flies faster than the ground, so it catches up on whatever is in
+    // front of it. Add the distance it can gain before it reaches the panda.
+    if (next.movesFaster) gapPx += ((CONFIG.WIDTH + 20 - CONFIG.PANDA_X) * CONFIG.BIRD_EXTRA_SPEED) / this.speed;
     this.distToNextObstacle += gapPx;
     const nextObstacleX = obs.x + gapPx;
 
-    // Optional reward bamboo tied to this obstacle
+    // Optional reward tied to this obstacle: a rare heart, or a bamboo stick
     const bw = CONFIG.BAMBOO_WIDTH;
-    if (kind === "rock" && Math.random() < CONFIG.ROCK_REWARD_CHANCE) {
-      // Floating above the rock: grabbed by jumping over it
+    if (this.maybeSpawnHeart(obs)) {
+      // the heart is the reward this time
+    } else if (obs.kind === "ground" && Math.random() < CONFIG.ROCK_REWARD_CHANCE) {
+      // Floating above the obstacle: grabbed by jumping over it
       this.bamboos.push(new Bamboo(obs.x + obs.w / 2 - bw / 2, CONFIG.BAMBOO_REWARD_HEIGHT));
-    } else if (kind === "branch" && Math.random() < CONFIG.BRANCH_REWARD_CHANCE) {
-      // Low stick under the leaves: grabbed by ducking (fits below the leaves)
+    } else if (obs.kind === "overhead" && !type.movesFaster && Math.random() < CONFIG.BRANCH_REWARD_CHANCE) {
+      // Low stick under the branch: grabbed by ducking (fits below it)
       this.bamboos.push(new Bamboo(obs.x + obs.w * 0.35, CONFIG.BAMBOO_GROUND_HEIGHT));
     }
 
     // Bamboo patterns in the empty stretch between this obstacle and the next
     this.placeBambooPatterns(obs.x + obs.w, nextObstacleX);
+  }
+
+  // Rarely put a heart pickup above a ground obstacle (jump to get it) or
+  // under an overhead one (duck to get it). Returns true if one was placed.
+  maybeSpawnHeart(obs) {
+    if (this.lives >= CONFIG.MAX_LIVES) return false;        // already full
+    if (this.pickups.length) return false;                    // one at a time
+    if (this.count - this.bambooAtLastHeart < CONFIG.HEART_MIN_BAMBOO_GAP) return false;
+    if (obs.type.movesFaster) return false;                   // not tied to a bird
+    if (Math.random() >= CONFIG.HEART_SPAWN_CHANCE) return false;
+    const hw = 26;
+    if (obs.kind === "ground") {
+      this.pickups.push(new HeartPickup(obs.x + obs.w / 2 - hw / 2, CONFIG.BAMBOO_REWARD_HEIGHT));
+    } else {
+      this.pickups.push(new HeartPickup(obs.x + obs.w * 0.35, CONFIG.BAMBOO_GROUND_HEIGHT));
+    }
+    this.bambooAtLastHeart = this.count;
+    return true;
   }
 
   // Fill the free space between two x positions with bamboo patterns,
@@ -1468,6 +2669,10 @@ class Game {
         this.updateParticles(dt);
         this.updateConfetti(dt);
         break;
+      case "showcase":
+        if (this.showcaseItem && "age" in this.showcaseItem) this.showcaseItem.age += dt;
+        if (this.showcaseItem && "phase" in this.showcaseItem) this.showcaseItem.phase += dt * 3;
+        break;
       // "paused": nothing moves
     }
   }
@@ -1475,6 +2680,7 @@ class Game {
   updatePlaying(dt) {
     const speed = this.speed;
     this.background.update(dt, speed * CONFIG.PARALLAX_GROUND);
+    this.zoneBlend = Math.min(1, this.zoneBlend + dt / CONFIG.ZONE_FADE_TIME);
 
     // Panda physics (legs animate faster when the world is faster)
     if (this.panda.update(dt, speed / CONFIG.START_SPEED)) this.sound.jump();
@@ -1482,8 +2688,10 @@ class Game {
     // Move obstacles and bamboo, drop the ones that left the screen
     for (const o of this.obstacles) o.update(dt, speed);
     for (const b of this.bamboos) b.update(dt, speed);
+    for (const h of this.pickups) h.update(dt, speed);
     this.obstacles = this.obstacles.filter((o) => !o.offscreen);
     this.bamboos = this.bamboos.filter((b) => !b.offscreen);
+    this.pickups = this.pickups.filter((h) => !h.offscreen);
 
     // Spawn the next obstacle when enough distance has scrolled by
     this.distToNextObstacle -= speed * dt;
@@ -1501,6 +2709,9 @@ class Game {
         if (this.state !== "playing") return; // we just won
       }
     }
+    for (let i = this.pickups.length - 1; i >= 0; i--) {
+      if (overlaps(pandaBox, this.pickups[i].getHitbox())) this.collectHeart(this.pickups.splice(i, 1)[0]);
+    }
 
     // Touching an obstacle costs a heart, unless the panda is still flashing
     // from the last hit. Each obstacle can only ever hurt him once.
@@ -1511,7 +2722,7 @@ class Game {
         if (o.hasHit) continue;
         if (o.getHitboxes().some((box) => overlaps(pandaBox, box))) {
           o.hasHit = true;
-          this.loseLife(o.kind);
+          this.loseLife(o);
           if (this.state !== "playing") return; // that was the last heart
           break;
         }
@@ -1521,11 +2732,12 @@ class Game {
     this.updateParticles(dt);
   }
 
-  loseLife(kind) {
+  loseLife(obstacle) {
     this.lives--;
     this.heartLostAt[this.lives] = this.time;
+    if (obstacle.category === "lava") this.sound.sizzle();
     if (this.lives <= 0) {
-      this.gameOver(kind);
+      this.gameOver(obstacle);
       return;
     }
     this.invincibleTimer = CONFIG.INVINCIBLE_TIME;
@@ -1555,10 +2767,40 @@ class Game {
     }
     if (this.count >= CONFIG.WIN_TARGET) {
       this.win();
-    } else if (this.count % CONFIG.SPEED_STEP_EVERY === 0 &&
-               CONFIG.START_SPEED + this.speedLevel * CONFIG.SPEED_STEP <= CONFIG.MAX_SPEED) {
+      return;
+    }
+    if (this.count % CONFIG.SPEED_STEP_EVERY === 0 &&
+        CONFIG.START_SPEED + this.speedLevel * CONFIG.SPEED_STEP <= CONFIG.MAX_SPEED) {
       this.sound.levelUp();
       this.particles.push({ type: "banner", text: "Faster!", x: CONFIG.WIDTH / 2, y: 120, vy: -15, life: 1.3, max: 1.3 });
+    }
+    // Every ZONE_EVERY bamboo: move on to the next themed zone
+    if (CONFIG.ZONES_ENABLED && this.count % CONFIG.ZONE_EVERY === 0) {
+      const z = Math.floor(this.count / CONFIG.ZONE_EVERY) % ZONES.length;
+      if (z !== this.zoneIndex) {
+        this.zoneFrom = this.zoneIndex;
+        this.zoneIndex = z;
+        this.zoneBlend = 0;
+        this.particles.push({ type: "zone", text: ZONES[z].name, x: CONFIG.WIDTH / 2, y: 165, vy: -8, life: 2, max: 2 });
+      }
+    }
+  }
+
+  collectHeart(h) {
+    if (this.lives < CONFIG.MAX_LIVES) {
+      this.lives++;
+      this.heartSlots = Math.max(this.heartSlots, this.lives);
+      this.heartGainedAt[this.lives - 1] = this.time;
+    }
+    this.sound.powerUp();
+    this.particles.push({ type: "heart", text: "+1", x: h.x + h.w / 2 - 8, y: h.y, vy: -50, life: 1.1, max: 1.1 });
+    for (let i = 0; i < 9; i++) {
+      const a = rand(0, Math.PI * 2);
+      this.particles.push({
+        type: "spark", x: h.x + h.w / 2, y: h.y + h.h / 2,
+        vx: Math.cos(a) * rand(60, 150), vy: Math.sin(a) * rand(60, 150),
+        life: 0.6, max: 0.6, color: choose(["#ff8fa3", "#fff6b0", "#ffffff"]),
+      });
     }
   }
 
@@ -1583,9 +2825,14 @@ class Game {
   /* ---------------------------- Drawing ---------------------------- */
 
   draw(ctx) {
-    this.background.draw(ctx);
+    if (this.state === "showcase") {
+      this.drawShowcase(ctx);
+      return;
+    }
+    this.background.draw(ctx, this.palette);
     for (const b of this.bamboos) b.draw(ctx);
-    for (const o of this.obstacles) o.draw(ctx);
+    for (const h of this.pickups) h.draw(ctx);
+    for (const o of this.obstacles) o.draw(ctx, this.time);
 
     // Panda pose depends on the game state
     let mode = "run";
@@ -1620,6 +2867,11 @@ class Game {
         drawText(ctx, p.text, p.x, p.y, 20, "#fff4a3", { stroke: "#3f7d22", strokeWidth: 4 });
       } else if (p.type === "ouch") {
         drawText(ctx, p.text, p.x, p.y, 22, "#ffffff", { stroke: "#c0392b", strokeWidth: 5 });
+      } else if (p.type === "heart") {
+        drawText(ctx, p.text, p.x, p.y, 22, "#ffffff", { stroke: "#c2185b", strokeWidth: 5 });
+        drawHeart(ctx, p.x + 26, p.y, 18, "#ff3b4f", "#9b1020");
+      } else if (p.type === "zone") {
+        drawText(ctx, p.text, p.x, p.y, 26, "#ffffff", { stroke: "#2f5d1a", strokeWidth: 6 });
       } else if (p.type === "banner") {
         drawText(ctx, p.text, p.x, p.y, 36, "#ffffff", { stroke: "#d35400", strokeWidth: 6 });
       } else {
@@ -1679,13 +2931,26 @@ class Game {
   }
 
   // Hearts in the top-right corner: red = life left, gray outline = used.
+  // A newly earned heart pops in with a quick grow animation.
   drawHearts(ctx) {
     const size = 26, gap = 36;
-    for (let i = 0; i < CONFIG.START_LIVES; i++) {
-      const cx = CONFIG.WIDTH - 30 - (CONFIG.START_LIVES - 1 - i) * gap;
+    const firstX = CONFIG.WIDTH - 30 - (Math.max(CONFIG.MAX_LIVES, CONFIG.START_LIVES) - 1) * gap;
+    for (let i = 0; i < this.heartSlots; i++) {
+      const cx = firstX + i * gap;
       const cy = 34;
       if (i < this.lives) {
-        drawHeart(ctx, cx, cy, size, "#e8333f", "#8e1621");
+        const t = this.time - (this.heartGainedAt[i] ?? -99);
+        if (t < 0.5) {
+          const k = t / 0.5;
+          const s = k < 0.6 ? (k / 0.6) * 1.35 : 1.35 - ((k - 0.6) / 0.4) * 0.35;
+          ctx.save();
+          ctx.translate(cx, cy);
+          ctx.scale(Math.max(0.01, s), Math.max(0.01, s));
+          drawHeart(ctx, 0, 0, size, "#e8333f", "#8e1621");
+          ctx.restore();
+        } else {
+          drawHeart(ctx, cx, cy, size, "#e8333f", "#8e1621");
+        }
         continue;
       }
       // Lost heart: gray outline, plus the breaking animation for a moment
@@ -1730,7 +2995,7 @@ class Game {
     drawText(ctx, "↑ Jump,  ↓ Duck,  collect 50 bamboo!", 520, 152, 20, "#2f5d1a");
     drawText(ctx, "Jump over rocks  •  Duck under branches", 520, 184, 15, "#555");
     drawText(ctx, `Hold ↓ in the air to drop faster  •  ${CONFIG.START_LIVES} lives`, 520, 206, 15, "#555");
-    drawText(ctx, "P / Esc pause  •  M mute  •  H hitboxes", 520, 228, 13, "#777");
+    drawText(ctx, "P / Esc pause  •  M mute  •  H hitboxes  •  O gallery", 520, 228, 13, "#777");
     if (Math.floor(this.time * 2) % 2 === 0) {
       drawText(ctx, "Press Space to Start", 520, 264, 24, "#d35400");
     }
@@ -1746,7 +3011,7 @@ class Game {
 
   drawGameOver(ctx) {
     drawPanel(ctx, 160, 70, 480, 180);
-    drawText(ctx, `Oops! The panda bonked into a ${this.hitBy}!`, 400, 105, 22, "#c0392b");
+    drawText(ctx, `Oops! The panda ${this.hitMessage}!`, 400, 105, 22, "#c0392b");
     drawText(ctx, `Bamboo this run: ${this.count}`, 400, 145, 20, "#2f5d1a");
     drawText(ctx, `Best this session: ${this.bestScore}`, 400, 175, 18, "#555");
     if (this.time - this.endTime > CONFIG.RESTART_DELAY && Math.floor(this.time * 2) % 2 === 0) {
@@ -1771,8 +3036,44 @@ class Game {
     outline(this.panda.getHitbox(), "#00c853");
     for (const o of this.obstacles) for (const b of o.getHitboxes()) outline(b, "#ff1744");
     for (const b of this.bamboos) outline(b.getHitbox(), "#ffab00");
+    for (const h of this.pickups) outline(h.getHitbox(), "#ff4fa3");
     drawText(ctx, `DEBUG  speed ${Math.round(this.speed)} px/s  fps ${Math.round(this.fps)}`,
       CONFIG.WIDTH - 14, 66, 12, "#b00020", { align: "right" });
+  }
+
+  // The "O" gallery: one item at a time, in its zone's scenery, with hitboxes.
+  drawShowcase(ctx) {
+    const z = ZONES[this.showcaseZone] || ZONES[0];
+    this.background.draw(ctx, blendPalettes(z, z, 0));
+    const item = this.showcaseItem;
+    item.draw(ctx, this.time);
+    this.panda.draw(ctx, "idle", this.time); // for size comparison
+    ctx.lineWidth = 1.5;
+    const outline = (b, color) => { ctx.strokeStyle = color; ctx.strokeRect(b.x, b.y, b.w, b.h); };
+    outline(this.panda.getHitbox(), "#00c853");
+    if (item instanceof HeartPickup) outline(item.getHitbox(), "#ff4fa3");
+    else for (const b of item.getHitboxes()) outline(b, "#ff1744");
+
+    const total = OBSTACLE_TYPES.length + 1;
+    drawPanel(ctx, 12, 10, 330, 124);
+    let title, line2, line3, line4;
+    if (item instanceof HeartPickup) {
+      title = "Heart pickup";
+      line2 = `Extra life, up to ${CONFIG.MAX_LIVES} hearts`;
+      line3 = `Only when below ${CONFIG.MAX_LIVES} hearts`;
+      line4 = `At most every ${CONFIG.HEART_MIN_BAMBOO_GAP} bamboo`;
+    } else {
+      const t = item.type;
+      title = t.name;
+      line2 = `${t.kind === "ground" ? "Ground: jump over" : "Overhead: duck under"}  •  ${t.category}`;
+      line3 = `Zones: ${t.zones.join(", ")}`;
+      line4 = `Appears from ${t.minBamboo} bamboo`;
+    }
+    drawText(ctx, `${this.showcaseIndex + 1} / ${total}   ${title}`, 26, 32, 16, "#2f5d1a", { align: "left" });
+    drawText(ctx, line2, 26, 55, 13, "#555", { align: "left" });
+    drawText(ctx, line3, 26, 74, 12, "#555", { align: "left" });
+    drawText(ctx, line4, 26, 92, 12, "#555", { align: "left" });
+    drawText(ctx, "O next  •  Shift+O back  •  Esc exit", 26, 116, 12, "#d35400", { align: "left" });
   }
 }
 
@@ -1789,31 +3090,59 @@ function runSelfChecks() {
   const ducking = insetBox(0, C.GROUND_Y - C.PANDA_DUCK_HEIGHT, C.PANDA_DUCK_WIDTH, C.PANDA_DUCK_HEIGHT);
   const feetInset = C.GROUND_Y - (standing.y + standing.h); // hitbox bottom sits this far above the feet
 
-  // Rocks: how long is the panda high enough, vs. how long he needs to be?
-  for (const s of C.ROCK_SIZES) {
-    const rock = insetBox(0, C.GROUND_Y - s.h, s.w, s.h);
-    const needH = C.GROUND_Y - rock.y - feetInset; // feet height needed to clear the rock
-    const timeAbove = needH <= 0 ? Infinity : (2 * Math.sqrt(C.JUMP_VELOCITY ** 2 - 2 * C.GRAVITY * needH)) / C.GRAVITY;
-    const timeNeeded = (standing.w + rock.w) / C.MAX_SPEED;
-    results.push({ check: `rock ${s.w}x${s.h} is jumpable`, ok: needH < peak && timeAbove > timeNeeded,
-      detail: `airborne-above ${timeAbove.toFixed(2)}s, need ${timeNeeded.toFixed(2)}s` });
+  const airTime = (2 * C.JUMP_VELOCITY) / C.GRAVITY;
+  const lowBamboo = insetBox(0, C.GROUND_Y - C.BAMBOO_GROUND_HEIGHT - C.BAMBOO_HEIGHT, C.BAMBOO_WIDTH, C.BAMBOO_HEIGHT);
+  const lowHeart = insetBox(0, C.GROUND_Y - C.BAMBOO_GROUND_HEIGHT - 24, 26, 24);
+  let lowestOverhead = 0;
+
+  // Build many random copies of every registry entry and check each one.
+  for (const type of OBSTACLE_TYPES) {
+    let ok = true, detail = "", worst = -Infinity; // report the hardest copy
+    for (let i = 0; i < 60; i++) {
+      const o = new Obstacle(type, 0);
+      o.age = Math.random() * 10; // birds bob over time
+      const raw = type.boxes(o);
+      const boxes = o.getHitboxes();
+      if (type.kind === "ground") {
+        // Jump over: is the panda high enough for long enough at top speed?
+        const rawHeight = C.GROUND_Y - Math.min(...raw.map((b) => b.y));
+        const top = Math.min(...boxes.map((b) => b.y));
+        const span = Math.max(...boxes.map((b) => b.x + b.w)) - Math.min(...boxes.map((b) => b.x));
+        const needH = Math.max(0, C.GROUND_Y - top - feetInset);
+        const timeAbove = (2 * Math.sqrt(C.JUMP_VELOCITY ** 2 - 2 * C.GRAVITY * needH)) / C.GRAVITY;
+        const timeNeeded = (standing.w + span) / C.MAX_SPEED;
+        // Require 1.5x the minimum so the take-off point is comfortable, not pixel-perfect
+        const good = rawHeight <= C.GROUND_OBSTACLE_MAX_HEIGHT && needH < peak && timeAbove > timeNeeded * 1.5;
+        const hardness = good ? timeNeeded / timeAbove : Infinity;
+        if (hardness > worst) {
+          worst = hardness;
+          detail = `hardest: height ${rawHeight.toFixed(0)}px, width ${o.w}px, airborne ${timeAbove.toFixed(2)}s vs needed ${timeNeeded.toFixed(2)}s`;
+        }
+        if (!good) ok = false;
+      } else {
+        // Duck under: everything solid ends above the ducking panda's head,
+        // and something solid is low enough to hit a standing panda.
+        const rawBottom = Math.max(...raw.map((b) => b.y + b.h));
+        const bottom = Math.max(...boxes.map((b) => b.y + b.h));
+        lowestOverhead = Math.max(lowestOverhead, bottom);
+        const good = rawBottom <= C.GROUND_Y - C.BRANCH_CLEARANCE && ducking.y >= bottom && standing.y < bottom;
+        const hardness = good ? bottom : Infinity;
+        if (hardness > worst) {
+          worst = hardness;
+          detail = `lowest solid point ${bottom.toFixed(1)}, ducking top ${ducking.y.toFixed(1)}, standing top ${standing.y.toFixed(1)}`;
+        }
+        if (!good) ok = false;
+      }
+    }
+    results.push({ check: `${type.name}: ${type.kind === "ground" ? "jumpable" : "duckable"}`, ok, detail });
   }
 
-  // Branches: hit while standing, clear while ducking
-  const leafBox = insetBox(0, C.GROUND_Y - C.BRANCH_CLEARANCE - C.BRANCH_THICKNESS, C.BRANCH_WIDTH, C.BRANCH_THICKNESS);
-  const leafBottom = leafBox.y + leafBox.h;
-  results.push({ check: "standing panda hits branch", ok: standing.y < leafBottom,
-    detail: `panda top ${standing.y.toFixed(1)} < leaves ${leafBottom.toFixed(1)}` });
-  results.push({ check: "ducking panda clears branch", ok: ducking.y >= leafBottom,
-    detail: `panda top ${ducking.y.toFixed(1)} >= leaves ${leafBottom.toFixed(1)}` });
-
-  // Low bamboo under a branch must not touch the leaves
-  const lowBamboo = insetBox(0, C.GROUND_Y - C.BAMBOO_GROUND_HEIGHT - C.BAMBOO_HEIGHT, C.BAMBOO_WIDTH, C.BAMBOO_HEIGHT);
-  results.push({ check: "under-branch bamboo is clear of leaves", ok: lowBamboo.y > leafBottom,
-    detail: `bamboo top ${lowBamboo.y.toFixed(1)} > leaves ${leafBottom.toFixed(1)}` });
+  // Rewards placed under overhead obstacles must not touch them
+  results.push({ check: "under-branch bamboo / heart clear of overhead hazards",
+    ok: lowBamboo.y > lowestOverhead && lowHeart.y > lowestOverhead,
+    detail: `bamboo top ${lowBamboo.y.toFixed(1)}, heart top ${lowHeart.y.toFixed(1)} > hazard bottom ${lowestOverhead.toFixed(1)}` });
 
   // Minimum gap leaves time to land from a jump before the next obstacle
-  const airTime = (2 * C.JUMP_VELOCITY) / C.GRAVITY;
   results.push({ check: "minimum gap > jump air time", ok: C.MIN_OBSTACLE_GAP > airTime,
     detail: `gap ${C.MIN_OBSTACLE_GAP}s vs air time ${airTime.toFixed(2)}s` });
 
