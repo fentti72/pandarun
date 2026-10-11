@@ -209,6 +209,8 @@ function roundRectPath(ctx, x, y, w, h, r) {
   ctx.closePath();
 }
 
+const capitalize = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+
 // Draw text with an optional outline, centred by default.
 function drawText(ctx, text, x, y, size, color, options = {}) {
   ctx.font = `${options.weight || "bold"} ${size}px ${CONFIG.FONT}`;
@@ -359,25 +361,28 @@ class Sound {
     osc.stop(t0 + duration + 0.02);
   }
 
-  // Cartoon "oww!": a sliding-down tone with a fast wobble (vibrato),
-  // softened by a low-pass filter. The music dips so it stands out.
-  ouch() {
+  // Cartoon "oww!": a sliding tone with a fast wobble (vibrato), softened
+  // by a low-pass filter. The music dips so it stands out. Each character
+  // passes its own settings (see CHARACTERS: panda "oww", dog yelp,
+  // unicorn whinny). mid = optional pitch to rise to before falling.
+  ouch(o = CHARACTERS[0].ouch) {
     if (!this.ctx || this.muted) return;
     const t0 = this.ctx.currentTime;
-    const dur = 0.42;
+    const dur = o.dur;
     const osc = this.ctx.createOscillator();
-    osc.type = "sawtooth";
-    osc.frequency.setValueAtTime(820, t0);
-    osc.frequency.exponentialRampToValueAtTime(300, t0 + dur);
+    osc.type = o.type;
+    osc.frequency.setValueAtTime(o.from, t0);
+    if (o.mid) osc.frequency.exponentialRampToValueAtTime(o.mid, t0 + dur * 0.25);
+    osc.frequency.exponentialRampToValueAtTime(o.to, t0 + dur);
     // Wobble: a second, slow oscillator nudges the pitch up and down
     const lfo = this.ctx.createOscillator();
     const lfoDepth = this.ctx.createGain();
-    lfo.frequency.value = 16;
-    lfoDepth.gain.value = 45;
+    lfo.frequency.value = o.wobbleHz;
+    lfoDepth.gain.value = o.wobbleDepth;
     lfo.connect(lfoDepth).connect(osc.frequency);
     const filter = this.ctx.createBiquadFilter();
     filter.type = "lowpass";
-    filter.frequency.value = 1800;
+    filter.frequency.value = o.filter;
     const gain = this.ctx.createGain();
     gain.gain.setValueAtTime(0.001, t0);
     gain.gain.exponentialRampToValueAtTime(0.3, t0 + 0.03);
@@ -389,8 +394,20 @@ class Sound {
   }
 
   jump()    { this.tone(260, 640, 0.18, "sine", 0.25); }                    // "boing"
-  collect() { this.tone(1320, 1320, 0.08, "triangle", 0.16);                 // "ding"
-              this.tone(1760, 1760, 0.16, "triangle", 0.14, 0.06); }
+  // Collect sound: "ding" (bamboo), "bark" (bones), "chime" (crystals)
+  collect(style = "ding") {
+    if (style === "bark") {           // short bark-like blip, then a ding
+      this.tone(560, 300, 0.07, "square", 0.11);
+      this.tone(620, 340, 0.06, "square", 0.08, 0.08);
+      this.tone(1320, 1320, 0.1, "triangle", 0.12, 0.12);
+    } else if (style === "chime") {   // sparkly rising chime
+      [1568, 2093, 2637].forEach((f, i) => this.tone(f, f, 0.14, "triangle", 0.12, i * 0.045));
+      this.tone(3136, 3136, 0.25, "sine", 0.06, 0.13);
+    } else {                          // the original "ding"
+      this.tone(1320, 1320, 0.08, "triangle", 0.16);
+      this.tone(1760, 1760, 0.16, "triangle", 0.14, 0.06);
+    }
+  }
   thud()    { this.tone(170, 45, 0.3, "square", 0.14);                       // "thud"
               this.tone(95, 40, 0.35, "sine", 0.4); }
   levelUp() { this.tone(660, 990, 0.15, "triangle", 0.12); }
@@ -691,8 +708,11 @@ class Panda {
     return insetBox(this.x - w / 2, this.y - h, w, h);
   }
 
-  // Draw the panda. mode is "run", "idle", "dizzy" or "happy".
-  draw(ctx, mode, time) {
+  // Draw the chosen character. mode is "run", "idle", "dizzy" or "happy";
+  // "run" picks the jump / duck / running pose from the physics state.
+  draw(ctx, mode, time, character = CHARACTERS[0]) {
+    const poses = character.poses;
+    const frame = Math.floor(this.animTime * CONFIG.RUN_ANIM_FPS) % 4;
     // Shadow on the ground (smaller when he is high up)
     const height = CONFIG.GROUND_Y - this.y;
     const s = Math.max(0.35, 1 - height / 220);
@@ -700,19 +720,12 @@ class Panda {
 
     ctx.save();
     ctx.translate(this.x, this.y);
-    if (mode === "idle") {
-      drawPandaIdle(ctx, time);
-    } else if (mode === "dizzy") {
-      drawPandaDizzy(ctx, time);
-    } else if (mode === "happy") {
-      drawPandaHappy(ctx, time);
-    } else if (!this.onGround) {
-      drawPandaJump(ctx);
-    } else if (this.isDucking) {
-      drawPandaDuck(ctx, Math.floor(this.animTime * CONFIG.RUN_ANIM_FPS) % 4);
-    } else {
-      drawPandaRun(ctx, Math.floor(this.animTime * CONFIG.RUN_ANIM_FPS) % 4);
-    }
+    if (mode === "idle") poses.idle(ctx, time);
+    else if (mode === "dizzy") poses.dizzy(ctx, time);
+    else if (mode === "happy") poses.happy(ctx, time);
+    else if (!this.onGround) poses.jump(ctx, time);
+    else if (this.isDucking) poses.duck(ctx, frame, time);
+    else poses.run(ctx, frame, time);
     ctx.restore();
   }
 }
@@ -883,6 +896,520 @@ function drawPandaHappy(ctx, time) {
   ellipse(ctx, 22, -52, 6.5, 12, 0.5 - wave, PANDA_BLACK);
   drawPandaHead(ctx, 9, -52, 17, "happy", "open");
 }
+
+
+/* ---- Dog drawing functions ----
+   Same rules as the panda: origin (0,0) between the feet, facing right,
+   and the standing / ducking drawings fit the shared player hitbox.
+   The wagging tail is decoration (it sticks out behind the hitbox). */
+const DOG_FUR = "#d9a05b";
+const DOG_DARK = "#b47a3c";
+const DOG_LIGHT = "#f6dfb8";
+const DOG_EAR = "#8a5a2b";
+const DOG_LINE = "#5a3a1a";
+
+// Head with snout, floppy ear and tongue.
+// eyes: "open" | "blink" | "happy" | "x"   ear: "down" | "up" | "flat"
+function drawDogHead(ctx, cx, cy, r, eyes = "open", ear = "down", tongue = true, t = 0) {
+  // Far ear peeks out behind the head
+  ellipse(ctx, cx + r * 0.35, cy - r * 0.75, r * 0.22, r * 0.32, 0.4, DOG_EAR);
+  ellipse(ctx, cx, cy, r, r * 0.95, 0, DOG_FUR, DOG_LINE, 2);
+  // Snout and nose
+  ellipse(ctx, cx + r * 0.72, cy + r * 0.28, r * 0.55, r * 0.4, 0, DOG_LIGHT, DOG_LINE, 1.5);
+  ellipse(ctx, cx + r * 1.18, cy + r * 0.12, r * 0.17, r * 0.13, 0, "#222");
+  ellipse(ctx, cx + r * 1.14, cy + r * 0.07, r * 0.06, r * 0.04, 0, "rgba(255,255,255,0.7)");
+  // Mouth and tongue
+  ctx.strokeStyle = DOG_LINE;
+  ctx.lineWidth = 1.3;
+  ctx.beginPath();
+  ctx.moveTo(cx + r * 1.12, cy + r * 0.28);
+  ctx.quadraticCurveTo(cx + r * 0.95, cy + r * 0.55, cx + r * 0.62, cy + r * 0.45);
+  ctx.stroke();
+  if (tongue) {
+    const wag = Math.sin(t * 14) * 0.08;
+    ellipse(ctx, cx + r * 0.8, cy + r * 0.66, r * 0.15, r * 0.27, wag, "#ff7b93", "#c94b62", 1);
+    ctx.beginPath();
+    ctx.moveTo(cx + r * 0.8, cy + r * 0.5);
+    ctx.lineTo(cx + r * 0.8, cy + r * 0.78);
+    ctx.stroke();
+  }
+  ellipse(ctx, cx + r * 0.25, cy + r * 0.38, r * 0.15, r * 0.09, 0, "rgba(255,120,120,0.45)"); // blush
+  // Eyes
+  ctx.strokeStyle = "#2a1a0a";
+  ctx.lineWidth = 1.8;
+  ctx.lineCap = "round";
+  for (const ex of [cx + r * 0.05, cx + r * 0.52]) {
+    const ey = cy - r * 0.18;
+    if (eyes === "open") {
+      ellipse(ctx, ex, ey, r * 0.12, r * 0.14, 0, "#2a1a0a");
+      ellipse(ctx, ex + r * 0.04, ey - r * 0.05, r * 0.04, r * 0.04, 0, "#fff");
+    } else if (eyes === "blink") {
+      ctx.beginPath(); ctx.moveTo(ex - r * 0.1, ey); ctx.lineTo(ex + r * 0.1, ey); ctx.stroke();
+    } else if (eyes === "happy") {
+      ctx.beginPath(); ctx.arc(ex, ey + r * 0.05, r * 0.1, Math.PI * 1.1, Math.PI * 1.9); ctx.stroke();
+    } else if (eyes === "x") {
+      const d = r * 0.09;
+      ctx.beginPath();
+      ctx.moveTo(ex - d, ey - d); ctx.lineTo(ex + d, ey + d);
+      ctx.moveTo(ex + d, ey - d); ctx.lineTo(ex - d, ey + d);
+      ctx.stroke();
+    }
+  }
+  // Floppy front ear (drawn last so it hangs over the head)
+  const flop = Math.sin(t * 12) * 0.12;
+  if (ear === "up") ellipse(ctx, cx - r * 0.55, cy - r * 0.85, r * 0.27, r * 0.6, -1.0 + flop, DOG_EAR, DOG_LINE, 1.5);
+  else if (ear === "flat") ellipse(ctx, cx - r * 0.75, cy + r * 0.1, r * 0.27, r * 0.6, 1.25, DOG_EAR, DOG_LINE, 1.5);
+  else ellipse(ctx, cx - r * 0.5, cy + r * 0.05, r * 0.3, r * 0.62, 0.35 + flop, DOG_EAR, DOG_LINE, 1.5);
+}
+
+// Wagging tail; angle tilts it (bigger = further back).
+function drawDogTail(ctx, x, y, angle) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(angle);
+  ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.quadraticCurveTo(-9, -3, -10, -15);
+  ctx.strokeStyle = DOG_LINE;
+  ctx.lineWidth = 7.5;
+  ctx.stroke();
+  ctx.strokeStyle = DOG_DARK;
+  ctx.lineWidth = 4.5;
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawDogBody(ctx, cx, cy, rx, ry) {
+  ellipse(ctx, cx, cy, rx, ry, 0, DOG_FUR, DOG_LINE, 2);
+  ellipse(ctx, cx + rx * 0.3, cy + ry * 0.25, rx * 0.45, ry * 0.55, 0, DOG_LIGHT); // tummy
+  // Red collar with a gold tag
+  ctx.beginPath();
+  ctx.moveTo(cx + rx * 0.15, cy - ry * 0.9);
+  ctx.quadraticCurveTo(cx + rx * 0.6, cy - ry * 0.55, cx + rx * 0.85, cy - ry * 0.3);
+  ctx.strokeStyle = "#d63b3b";
+  ctx.lineWidth = 4;
+  ctx.lineCap = "round";
+  ctx.stroke();
+  ellipse(ctx, cx + rx * 0.62, cy - ry * 0.4, 2.8, 2.8, 0, "#f6c945", "#b8860b", 1);
+}
+
+function drawDogLeg(ctx, x, lift) {
+  roundRectPath(ctx, x - 6.5, -19 - lift, 13, 19, 6);
+  ctx.fillStyle = DOG_DARK;
+  ctx.fill();
+  ctx.strokeStyle = DOG_LINE;
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+  ellipse(ctx, x + 1, -2.5 - lift, 6, 2.6, 0, DOG_LIGHT);
+}
+
+function drawDogRun(ctx, frame, t) {
+  const legs = [[-9, 0, 9, 0], [-3, 5, 3, 0], [9, 0, -9, 0], [3, 0, -3, 5]][frame];
+  const armSwing = [0.6, 0, -0.6, 0][frame];
+  const bob = frame % 2 === 1 ? -2 : 0;
+  drawDogTail(ctx, -22, -36 + bob, Math.sin(t * 22) * 0.45); // wagging
+  ellipse(ctx, -9, -33 + bob, 6, 12, -armSwing, DOG_DARK);
+  drawDogLeg(ctx, -2 + legs[0], legs[1]);
+  drawDogLeg(ctx, -2 + legs[2], legs[3]);
+  drawDogBody(ctx, -2, -31 + bob, 23, 21);
+  ellipse(ctx, 9, -31 + bob, 6.5, 12, armSwing, DOG_FUR, DOG_LINE, 1.5);
+  drawDogHead(ctx, 6, -52 + bob, 16, "open", "down", true, t);
+}
+
+function drawDogIdle(ctx, t) {
+  const bob = Math.sin(t * 2.5) * 1.2;
+  const blink = t % 3.2 < 0.13;
+  drawDogTail(ctx, -22, -36 + bob, Math.sin(t * 10) * 0.4);
+  ellipse(ctx, -9, -33 + bob, 6, 12, 0.15, DOG_DARK);
+  drawDogLeg(ctx, -10, 0);
+  drawDogLeg(ctx, 6, 0);
+  drawDogBody(ctx, -2, -31 + bob, 23, 21);
+  ellipse(ctx, 12, -38 + bob, 6.5, 12, -1.8 + Math.sin(t * 6) * 0.35, DOG_FUR, DOG_LINE, 1.5); // wave
+  drawDogHead(ctx, 6, -52 + bob, 16, blink ? "blink" : "open", "down", true, t);
+}
+
+function drawDogJump(ctx, t) {
+  drawDogTail(ctx, -22, -38, -0.5);
+  ellipse(ctx, -16, -44, 6, 12, -0.9, DOG_DARK);
+  ellipse(ctx, -12, -13, 9, 7, 0.3, DOG_DARK, DOG_LINE, 1.2);
+  ellipse(ctx, 6, -11, 9, 7, -0.2, DOG_DARK, DOG_LINE, 1.2);
+  drawDogBody(ctx, -2, -32, 23, 21);
+  ellipse(ctx, 16, -40, 6.5, 12, 1.0, DOG_FUR, DOG_LINE, 1.5);
+  drawDogHead(ctx, 6, -53, 16, "open", "up", true, t);
+}
+
+// Low crouch with the ears flopped down.
+function drawDogDuck(ctx, frame, t) {
+  const s = frame % 2 === 0 ? 3 : -3;
+  drawDogTail(ctx, -28, -14, 0.9 + Math.sin(t * 22) * 0.25);
+  ellipse(ctx, -17 + s, -5, 7, 5, 0, DOG_DARK);
+  ellipse(ctx, 7 - s, -5, 7, 5, 0, DOG_DARK);
+  drawDogBody(ctx, -6, -16, 26, 13);
+  ellipse(ctx, 13, -6, 6, 4.5, 0, DOG_FUR, DOG_LINE, 1.2);
+  drawDogHead(ctx, 15, -20, 13, "open", "flat", true, t);
+}
+
+function drawDogDizzy(ctx, t) {
+  ctx.save();
+  ctx.rotate(-0.18);
+  drawDogTail(ctx, -24, -12, 1.4);
+  ellipse(ctx, 16, -7, 10, 6.5, -0.3, DOG_DARK, DOG_LINE, 1.2);
+  ellipse(ctx, 2, -5, 10, 6.5, 0.2, DOG_DARK, DOG_LINE, 1.2);
+  ellipse(ctx, -20, -20, 6, 11, 0.9, DOG_DARK);
+  drawDogBody(ctx, -4, -25, 23, 20);
+  ellipse(ctx, 13, -22, 6, 11, -0.7, DOG_FUR, DOG_LINE, 1.5);
+  drawDogHead(ctx, 3, -47, 16, "x", "flat", true, t);
+  for (let i = 0; i < 3; i++) {
+    const a = t * 4 + (i * Math.PI * 2) / 3;
+    drawStar(ctx, 3 + Math.cos(a) * 24, -70 + Math.sin(a) * 6, 5, "#ffd23f");
+  }
+  ctx.restore();
+}
+
+function drawDogHappy(ctx, t) {
+  const wave = Math.sin(t * 10) * 0.2;
+  drawDogTail(ctx, -22, -36, Math.sin(t * 30) * 0.5);
+  drawDogLeg(ctx, -10, 2);
+  drawDogLeg(ctx, 6, 2);
+  ellipse(ctx, -20, -50, 6, 12, -0.5 + wave, DOG_DARK);
+  drawDogBody(ctx, -2, -31, 23, 21);
+  ellipse(ctx, 22, -52, 6.5, 12, 0.5 - wave, DOG_FUR, DOG_LINE, 1.5);
+  drawDogHead(ctx, 6, -52, 16, "happy", "up", true, t);
+}
+
+
+/* ---- Unicorn drawing functions ----
+   A chibi unicorn on four galloping legs. The horn and the rainbow tail
+   are decoration; the body, legs and head fit the shared player hitbox. */
+const UNI_BODY = "#fdf2f8";
+const UNI_SHADE = "#ecd9e8";
+const UNI_LINE = "#9a7aa0";
+const UNI_HOOF = "#c9a96e";
+const RAINBOW = ["#ff9aa2", "#ffb86b", "#fff07a", "#9be7a0", "#8ecbff", "#c3a6ff"];
+
+// One leg hanging from a hip/shoulder at (px, py), rotated by `angle`
+// (positive swings the hoof backward). len scales the leg (ducking).
+function drawUnicornLeg(ctx, px, py, angle, color, len = 1) {
+  ctx.save();
+  ctx.translate(px, py);
+  ctx.rotate(angle);
+  ctx.scale(1, len);
+  roundRectPath(ctx, -3.4, 0, 6.8, 17, 3);
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.strokeStyle = UNI_LINE;
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+  roundRectPath(ctx, -3.6, 15, 7.2, 4.5, 1.5);
+  ctx.fillStyle = UNI_HOOF;
+  ctx.fill();
+  ctx.restore();
+}
+
+// Rainbow tail flowing behind (decoration).
+function drawUnicornTail(ctx, x, y, t, lift = 0) {
+  ctx.lineCap = "round";
+  RAINBOW.forEach((c, i) => {
+    const sway = Math.sin(t * 8 + i * 0.5) * 3;
+    ctx.beginPath();
+    ctx.moveTo(x, y + i * 1.4);
+    ctx.quadraticCurveTo(x - 10, y - 6 - lift + i * 2, x - 13 + sway, y + 12 - lift * 1.5 + i * 2.4);
+    ctx.strokeStyle = c;
+    ctx.lineWidth = 3.2;
+    ctx.stroke();
+  });
+}
+
+// Rainbow mane: a row of puffs from (x0, y0) down to (x1, y1).
+function drawUnicornMane(ctx, x0, y0, x1, y1, t) {
+  const n = 6;
+  for (let i = 0; i < n; i++) {
+    const f = i / (n - 1);
+    const wob = Math.sin(t * 6 + i) * 0.8;
+    ellipse(ctx, x0 + (x1 - x0) * f + wob, y0 + (y1 - y0) * f, 5, 4.5, 0, RAINBOW[i % RAINBOW.length]);
+  }
+}
+
+// Head drawn around (0,0) facing right; the caller translates / rotates it.
+function drawUnicornHead(ctx, eyes = "open", t = 0) {
+  // Golden spiral horn (decoration, not part of the hitbox)
+  ctx.beginPath();
+  ctx.moveTo(-1.5, -8);
+  ctx.lineTo(4.5, -8.5);
+  ctx.lineTo(4, -23);
+  ctx.closePath();
+  ctx.fillStyle = "#f6c945";
+  ctx.fill();
+  ctx.strokeStyle = "#c9962a";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  for (let k = 0; k < 3; k++) {
+    ctx.beginPath();
+    ctx.moveTo(-0.5 + k * 1.2, -10.5 - k * 4);
+    ctx.lineTo(4.2 - k * 0.2, -12 - k * 4);
+    ctx.stroke();
+  }
+  // Ear
+  ctx.beginPath();
+  ctx.moveTo(-6, -6); ctx.lineTo(-4.5, -14); ctx.lineTo(-1, -7);
+  ctx.closePath();
+  ctx.fillStyle = UNI_BODY;
+  ctx.fill();
+  ctx.strokeStyle = UNI_LINE;
+  ctx.stroke();
+  // Head and snout
+  ellipse(ctx, 0, 0, 10, 9, 0, UNI_BODY, UNI_LINE, 1.6);
+  ellipse(ctx, 7, 3.5, 7, 6, 0, "#fde4ef", UNI_LINE, 1.4);
+  ellipse(ctx, 11, 2.5, 1, 1.4, 0, UNI_LINE);
+  ellipse(ctx, 3, 4.5, 2.4, 1.4, 0, "rgba(255,120,160,0.45)"); // blush
+  ctx.beginPath();
+  ctx.moveTo(8, 7);
+  ctx.quadraticCurveTo(10, 8.5, 12, 7);
+  ctx.strokeStyle = UNI_LINE;
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  // Eye with lashes
+  ctx.strokeStyle = "#4a2a50";
+  ctx.lineWidth = 1.5;
+  ctx.lineCap = "round";
+  const ex = 1, ey = -1.5;
+  if (eyes === "open") {
+    ellipse(ctx, ex, ey, 2.3, 2.8, 0, "#4a2a50");
+    ellipse(ctx, ex + 0.8, ey - 1, 0.8, 0.8, 0, "#fff");
+    ctx.beginPath();
+    ctx.moveTo(ex - 2, ey - 2); ctx.lineTo(ex - 3.5, ey - 4);
+    ctx.moveTo(ex, ey - 2.8); ctx.lineTo(ex - 0.5, ey - 5);
+    ctx.stroke();
+  } else if (eyes === "blink" || eyes === "happy") {
+    ctx.beginPath();
+    if (eyes === "happy") ctx.arc(ex, ey + 0.5, 2.3, Math.PI * 1.1, Math.PI * 1.9);
+    else { ctx.moveTo(ex - 2.3, ey); ctx.lineTo(ex + 2.3, ey); }
+    ctx.stroke();
+  } else if (eyes === "x") {
+    ctx.beginPath();
+    ctx.moveTo(ex - 2, ey - 2); ctx.lineTo(ex + 2, ey + 2);
+    ctx.moveTo(ex + 2, ey - 2); ctx.lineTo(ex - 2, ey + 2);
+    ctx.stroke();
+  }
+}
+
+// Standing / running body. legAngles = [backFar, frontFar, backNear, frontNear].
+function drawUnicornStanding(ctx, legAngles, bob, eyes, t, headTilt = 0) {
+  drawUnicornTail(ctx, -25, -38 + bob, t);
+  drawUnicornLeg(ctx, -15, -21 + bob, legAngles[0], UNI_SHADE);
+  drawUnicornLeg(ctx, 6, -21 + bob, legAngles[1], UNI_SHADE);
+  ellipse(ctx, -6, -33 + bob, 21, 13, 0, UNI_BODY, UNI_LINE, 1.8);
+  drawUnicornLeg(ctx, -19, -21 + bob, legAngles[2], UNI_BODY);
+  drawUnicornLeg(ctx, 2, -21 + bob, legAngles[3], UNI_BODY);
+  ellipse(ctx, 10, -45 + bob, 7, 12, 0.45, UNI_BODY, UNI_LINE, 1.6);    // neck
+  ellipse(ctx, 10, -42 + bob, 5.2, 10, 0.45, UNI_BODY);                // hide the neck seam
+  drawUnicornMane(ctx, 8, -63 + bob, -1, -44 + bob, t);
+  ctx.save();
+  ctx.translate(15, -56 + bob);
+  ctx.rotate(headTilt);
+  drawUnicornHead(ctx, eyes, t);
+  ctx.restore();
+}
+
+function drawUnicornRun(ctx, frame, t) {
+  const p = (frame * Math.PI) / 2;
+  const a = (o) => Math.sin(p + o) * 0.5;
+  drawUnicornStanding(ctx, [a(0.6), a(Math.PI + 0.6), a(0), a(Math.PI)], frame % 2 ? -2 : 0, "open", t);
+}
+
+function drawUnicornIdle(ctx, t) {
+  const bob = Math.sin(t * 2.5) * 1.2;
+  drawUnicornStanding(ctx, [0.05, -0.05, -0.05, 0.05], bob, t % 3.2 < 0.13 ? "blink" : "open", t, Math.sin(t * 1.5) * 0.06);
+}
+
+function drawUnicornJump(ctx, t) {
+  drawUnicornStanding(ctx, [1.1, -1.25, 0.9, -1.05], -2, "open", t, -0.1);
+}
+
+// Ducking: low body, bent legs, head and horn lowered forward.
+function drawUnicornDuck(ctx, frame, t) {
+  const sw = frame % 2 ? 0.25 : -0.25;
+  drawUnicornTail(ctx, -27, -24, t, -4);
+  drawUnicornLeg(ctx, -15, -12, sw, UNI_SHADE, 0.62);
+  drawUnicornLeg(ctx, 6, -12, -sw, UNI_SHADE, 0.62);
+  ellipse(ctx, -7, -20, 22, 10.5, 0, UNI_BODY, UNI_LINE, 1.8);
+  drawUnicornLeg(ctx, -19, -12, -sw, UNI_BODY, 0.62);
+  drawUnicornLeg(ctx, 2, -12, sw, UNI_BODY, 0.62);
+  drawUnicornMane(ctx, 7, -30, -6, -26, t);
+  ctx.save();
+  ctx.translate(19, -19);
+  ctx.rotate(0.75); // head down, horn pointing forward
+  drawUnicornHead(ctx, "open", t);
+  ctx.restore();
+}
+
+function drawUnicornDizzy(ctx, t) {
+  ctx.save();
+  ctx.rotate(-0.12);
+  drawUnicornTail(ctx, -24, -16, t, -6);
+  drawUnicornLeg(ctx, -14, -12, -1.3, UNI_SHADE);
+  drawUnicornLeg(ctx, 4, -12, -1.4, UNI_SHADE);
+  ellipse(ctx, -6, -19, 21, 12, 0, UNI_BODY, UNI_LINE, 1.8);
+  drawUnicornLeg(ctx, -18, -12, -1.5, UNI_BODY);
+  drawUnicornLeg(ctx, 0, -12, -1.6, UNI_BODY);
+  drawUnicornMane(ctx, 6, -44, -2, -28, t);
+  ctx.save();
+  ctx.translate(12, -40);
+  ctx.rotate(-0.35);
+  drawUnicornHead(ctx, "x", t);
+  ctx.restore();
+  for (let i = 0; i < 3; i++) {
+    const a = t * 4 + (i * Math.PI * 2) / 3;
+    drawStar(ctx, 10 + Math.cos(a) * 22, -66 + Math.sin(a) * 6, 5, "#ffd23f");
+  }
+  ctx.restore();
+}
+
+// Happy: rearing up on the back legs.
+function drawUnicornHappy(ctx, t) {
+  ctx.save();
+  ctx.rotate(-0.28);
+  const kick = Math.sin(t * 10) * 0.3;
+  drawUnicornStanding(ctx, [0.1, -1.1 + kick, -0.1, -1.3 - kick], 0, "happy", t, 0.1);
+  ctx.restore();
+}
+
+
+/* ---- Collectibles ----
+   All of them are drawn inside the same 16 x 40 box as the bamboo stick,
+   so they share the same hitbox. (cx, top) = top centre, h = height. */
+
+// Classic cartoon dog bone, tilted.
+function drawBone(ctx, cx, top, h) {
+  ctx.save();
+  ctx.translate(cx, top + h / 2);
+  ctx.rotate(0.35);
+  const half = h * 0.36, k = h * 0.12;
+  for (const sy of [-half, half]) {
+    for (const sx of [-k * 0.75, k * 0.75]) ellipse(ctx, sx, sy, k, k, 0, "#fffaf0", "#b8a888", 1.5);
+  }
+  ctx.fillStyle = "#fffaf0";
+  ctx.fillRect(-k * 0.75, -half, k * 1.5, half * 2);
+  ctx.strokeStyle = "#b8a888";
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(-k * 0.75, -half + k * 0.6); ctx.lineTo(-k * 0.75, half - k * 0.6);
+  ctx.moveTo(k * 0.75, -half + k * 0.6); ctx.lineTo(k * 0.75, half - k * 0.6);
+  ctx.stroke();
+  ctx.restore();
+}
+
+const CRYSTAL_COLORS = [
+  ["#ffb3da", "#ff5fa8", "#c2307a"], // pink
+  ["#d6c2ff", "#9a6cf2", "#6a3cc0"], // purple
+  ["#bfeaff", "#55bdf2", "#2a86c0"], // light blue
+];
+
+// Pointed magic gem with a soft glow and a twinkle. variant picks the color.
+function drawCrystal(ctx, cx, top, h, t = 0, variant = 0) {
+  const [light, mid, dark] = CRYSTAL_COLORS[variant % CRYSTAL_COLORS.length];
+  const w = h * 0.2;
+  const g = ctx.createRadialGradient(cx, top + h / 2, 2, cx, top + h / 2, h * 0.6);
+  g.addColorStop(0, "rgba(255,255,255,0.35)");
+  g.addColorStop(1, "rgba(255,255,255,0)");
+  ctx.fillStyle = g;
+  ctx.fillRect(cx - h * 0.6, top - h * 0.1, h * 1.2, h * 1.2);
+  const pts = [[0, 0], [w, h * 0.3], [w * 0.85, h * 0.72], [0, h], [-w * 0.85, h * 0.72], [-w, h * 0.3]];
+  ctx.beginPath();
+  for (const [px, py] of pts) ctx.lineTo(cx + px, top + py);
+  ctx.closePath();
+  ctx.fillStyle = mid;
+  ctx.fill();
+  ctx.strokeStyle = dark;
+  ctx.lineWidth = 1.3;
+  ctx.stroke();
+  // Facets: lighter left face, centre ridge
+  ctx.beginPath();
+  ctx.moveTo(cx, top); ctx.lineTo(cx - w, top + h * 0.3); ctx.lineTo(cx - w * 0.85, top + h * 0.72); ctx.lineTo(cx, top + h);
+  ctx.closePath();
+  ctx.fillStyle = light;
+  ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(cx, top); ctx.lineTo(cx, top + h);
+  ctx.moveTo(cx - w, top + h * 0.3); ctx.lineTo(cx + w, top + h * 0.3);
+  ctx.strokeStyle = "rgba(255,255,255,0.7)";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  const tw = 1.5 + 2.5 * Math.abs(Math.sin(t * 3 + variant * 1.7));
+  drawStar(ctx, cx + w * 0.55, top + h * 0.22, tw, "#ffffff");
+}
+
+
+/* =====================================================================
+   Characters registry
+   Each entry describes one playable character. To add a character, add
+   one entry with:
+     id, name, the     - id, display name, and how messages refer to it
+     collectible       - { one, many }: names of the thing it collects
+     poses             - draw functions, all with the origin between the
+                         feet: run(ctx, frame 0-3, t), idle(ctx, t),
+                         jump(ctx, t), duck(ctx, frame, t), dizzy(ctx, t),
+                         happy(ctx, t). Keep standing poses inside
+                         PANDA_WIDTH x PANDA_HEIGHT and the duck pose inside
+                         PANDA_DUCK_WIDTH x PANDA_DUCK_HEIGHT: every
+                         character shares the same hitbox.
+     drawCollectible   - (ctx, cx, top, h, t, variant): draws one collectible
+                         inside the bamboo-sized box
+     collectSound      - "ding" | "bark" | "chime" (see Sound.collect)
+     ouch              - settings for its "ouch" sound (see Sound.ouch)
+     sparkColors       - colors of the collect burst
+     sparkleTrail      - true = leave a little sparkle trail while running
+     accent            - text color used for its name and counter
+   ===================================================================== */
+const CHARACTERS = [
+  {
+    id: "panda", name: "Panda", the: "the panda",
+    collectible: { one: "bamboo", many: "bamboo" },
+    poses: {
+      run: (ctx, f) => drawPandaRun(ctx, f),
+      idle: (ctx, t) => drawPandaIdle(ctx, t),
+      jump: (ctx) => drawPandaJump(ctx),
+      duck: (ctx, f) => drawPandaDuck(ctx, f),
+      dizzy: (ctx, t) => drawPandaDizzy(ctx, t),
+      happy: (ctx, t) => drawPandaHappy(ctx, t),
+    },
+    drawCollectible: (ctx, cx, top, h) => drawBambooStalk(ctx, cx, top, h),
+    collectSound: "ding",
+    ouch: { type: "sawtooth", from: 820, to: 300, dur: 0.42, wobbleHz: 16, wobbleDepth: 45, filter: 1800 },
+    sparkColors: ["#ffe066", "#b6f07a", "#ffffff"],
+    accent: "#2f5d1a",
+  },
+  {
+    id: "dog", name: "Dog", the: "the dog",
+    collectible: { one: "bone", many: "bones" },
+    poses: {
+      run: drawDogRun, idle: drawDogIdle, jump: drawDogJump,
+      duck: drawDogDuck, dizzy: drawDogDizzy, happy: drawDogHappy,
+    },
+    drawCollectible: (ctx, cx, top, h) => drawBone(ctx, cx, top, h),
+    collectSound: "bark",
+    // A quick, high yelp
+    ouch: { type: "sawtooth", from: 1400, to: 620, dur: 0.26, wobbleHz: 28, wobbleDepth: 60, filter: 2600 },
+    sparkColors: ["#fff4d6", "#ffd27a", "#ffffff"],
+    accent: "#8a4f16",
+  },
+  {
+    id: "unicorn", name: "Unicorn", the: "the unicorn",
+    collectible: { one: "magic crystal", many: "magic crystals" },
+    poses: {
+      run: drawUnicornRun, idle: drawUnicornIdle, jump: drawUnicornJump,
+      duck: drawUnicornDuck, dizzy: drawUnicornDizzy, happy: drawUnicornHappy,
+    },
+    drawCollectible: (ctx, cx, top, h, t, variant) => drawCrystal(ctx, cx, top, h, t, variant),
+    collectSound: "chime",
+    // A soft whinny: up, then down, with a wide fast wobble
+    ouch: { type: "triangle", from: 700, mid: 1250, to: 440, dur: 0.6, wobbleHz: 9, wobbleDepth: 90, filter: 3200 },
+    sparkColors: ["#ffb3da", "#d6c2ff", "#bfeaff", "#fff6b0"],
+    sparkleTrail: true,
+    accent: "#8a3cc0",
+  },
+];
 
 
 /* =====================================================================
@@ -2021,6 +2548,7 @@ class Bamboo {
     this.y = CONFIG.GROUND_Y - heightAboveGround - this.h; // top edge
     this.floating = heightAboveGround > 10;
     this.phase = rand(0, Math.PI * 2);
+    this.variant = randInt(0, 2); // e.g. which color a magic crystal is
   }
 
   update(dt, speed) {
@@ -2037,13 +2565,15 @@ class Bamboo {
     return insetBox(this.x, this.y, this.w, this.h);
   }
 
-  draw(ctx) {
+  // Drawn as the chosen character's collectible (bamboo, bone, crystal...).
+  // Whatever it looks like, the hitbox above stays the same.
+  draw(ctx, character = CHARACTERS[0], t = 0) {
     const bob = this.floating ? Math.sin(this.phase) * 2 : 0;
     if (this.floating) {
-      // Soft glow so floating sticks stand out
+      // Soft glow so floating pickups stand out
       ellipse(ctx, this.x + this.w / 2, this.y + this.h / 2 + bob, 16, 24, 0, "rgba(255,255,200,0.25)");
     }
-    drawBambooStalk(ctx, this.x + this.w / 2, this.y + bob, this.h);
+    character.drawCollectible(ctx, this.x + this.w / 2, this.y + bob, this.h, t + this.phase, this.variant);
   }
 }
 
@@ -2317,6 +2847,9 @@ class Game {
     this.time = 0;          // total time, used for animations
     this.keys = new Set();  // keys currently held down
     this.fps = 60;
+    this.characterIndex = 0; // chosen character (remembered for the session)
+    this.selectIndex = 0;    // highlighted card on the Character Select screen
+    this.trailTimer = 0;     // for the unicorn's sparkle trail
     this.showcaseIndex = 0; // which item the "O" gallery is showing
     this.showcaseItem = null;
     this.resetRun();
@@ -2347,6 +2880,10 @@ class Game {
     // Distance (px) still to scroll before the next obstacle appears
     this.distToNextObstacle = CONFIG.START_SPEED * CONFIG.FIRST_OBSTACLE_DELAY;
     this.nextObstacleType = this.pickObstacleType();
+  }
+
+  get character() {
+    return CHARACTERS[this.characterIndex];
   }
 
   // Current scroll speed: a small bump every SPEED_STEP_EVERY bamboo.
@@ -2400,7 +2937,40 @@ class Game {
     // something to grab right away.
     const firstObstacleX = CONFIG.WIDTH + 20 + this.distToNextObstacle;
     this.placeBambooPatterns(CONFIG.WIDTH - 200, firstObstacleX);
-    this.sound.music.start();
+    // Music may already be playing from the Character Select screen
+    if (this.sound.music.state !== "playing") this.sound.music.start();
+  }
+
+  // Character Select screen (the music starts here so the game flows in)
+  openSelect() {
+    this.resetRun();
+    this.state = "select";
+    this.selectIndex = this.characterIndex; // last choice is highlighted
+    if (this.sound.music.state !== "playing") this.sound.music.start();
+  }
+
+  pickCharacter(i) {
+    this.characterIndex = this.selectIndex = i;
+    this.start();
+  }
+
+  // Card layout on the Character Select screen
+  selectCard(i) {
+    const n = CHARACTERS.length, w = 190, gap = 30;
+    const left = (CONFIG.WIDTH - (n * w + (n - 1) * gap)) / 2;
+    return { x: left + i * (w + gap), y: 62, w, h: 262 };
+  }
+
+  // Mouse / touch click, in game coordinates
+  onClick(x, y) {
+    if (this.state === "title") {
+      this.openSelect();
+    } else if (this.state === "select") {
+      CHARACTERS.forEach((c, i) => {
+        const r = this.selectCard(i);
+        if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) this.pickCharacter(i);
+      });
+    }
   }
 
   pause() {
@@ -2448,7 +3018,8 @@ class Game {
         vy: rand(60, 150),
         rot: rand(0, Math.PI * 2),
         vr: rand(-6, 6),
-        leaf: i % 3 === 0,
+        special: i % 3 === 0, // themed piece: leaf, bone or crystal
+        variant: i % 3,
         color: choose(colors),
       });
     }
@@ -2471,8 +3042,18 @@ class Game {
 
     switch (this.state) {
       case "title":
-        if (isStartKey) this.start();
+        if (isStartKey) this.openSelect();
         break;
+      case "select": {
+        const n = CHARACTERS.length;
+        if (key === "ArrowLeft") this.selectIndex = (this.selectIndex - 1 + n) % n;
+        if (key === "ArrowRight") this.selectIndex = (this.selectIndex + 1) % n;
+        const num = Number(key);
+        if (num >= 1 && num <= n) this.pickCharacter(num - 1);
+        else if (isStartKey) this.pickCharacter(this.selectIndex);
+        else if (key === "Escape") { this.sound.music.stop(); this.state = "title"; }
+        break;
+      }
       case "playing":
         if (key === "ArrowUp" && !e.repeat) this.panda.requestJump();
         if (key === "ArrowDown") this.panda.setDuck(true);
@@ -2483,7 +3064,8 @@ class Game {
         break;
       case "gameover":
       case "win":
-        if (isStartKey && this.time - this.endTime > CONFIG.RESTART_DELAY) this.start();
+        if (isStartKey && this.time - this.endTime > CONFIG.RESTART_DELAY) this.start(); // same character
+        if (key === "c" || key === "C") this.openSelect();
         break;
       case "showcase":
         if (key === "Escape" || isStartKey) {
@@ -2496,7 +3078,7 @@ class Game {
 
   // Step through the gallery: every registry entry, then the heart pickup.
   showcaseStep(dir) {
-    const list = [...OBSTACLE_TYPES, "heart"];
+    const list = [...OBSTACLE_TYPES, "heart", ...CHARACTERS.map((c) => ({ character: c }))];
     if (this.state !== "showcase") {
       this.sound.music.stop();
       this.state = "showcase";
@@ -2508,6 +3090,9 @@ class Game {
     const entry = list[this.showcaseIndex];
     if (entry === "heart") {
       this.showcaseItem = new HeartPickup(420 - 13, CONFIG.BAMBOO_MID_HEIGHT);
+      this.showcaseZone = 0;
+    } else if (entry.character) {
+      this.showcaseItem = { characterPage: entry.character };
       this.showcaseZone = 0;
     } else {
       const o = new Obstacle(entry, 0);
@@ -2684,6 +3269,19 @@ class Game {
 
     // Panda physics (legs animate faster when the world is faster)
     if (this.panda.update(dt, speed / CONFIG.START_SPEED)) this.sound.jump();
+    // Unicorn: a little sparkle trail drifting off behind her
+    if (this.character.sparkleTrail) {
+      this.trailTimer += dt;
+      if (this.trailTimer > 0.06) {
+        this.trailTimer = 0;
+        const p = this.panda;
+        this.particles.push({
+          type: "spark", x: p.x - 24, y: p.y - (p.isDucking ? 14 : 32) + rand(-8, 8),
+          vx: -speed * 0.6 - 30, vy: rand(-25, 10), life: 0.45, max: 0.45,
+          color: choose(this.character.sparkColors), size: 2.5,
+        });
+      }
+    }
 
     // Move obstacles and bamboo, drop the ones that left the screen
     for (const o of this.obstacles) o.update(dt, speed);
@@ -2741,7 +3339,7 @@ class Game {
       return;
     }
     this.invincibleTimer = CONFIG.INVINCIBLE_TIME;
-    this.sound.ouch();
+    this.sound.ouch(this.character.ouch);
     this.particles.push({ type: "ouch", text: "Ouch!", x: this.panda.x + 10, y: this.panda.y - 95,
       vy: -30, life: 0.9, max: 0.9 });
   }
@@ -2754,15 +3352,16 @@ class Game {
 
   collect(b) {
     this.count++;
-    this.sound.collect();
+    this.sound.collect(this.character.collectSound);
     const cx = b.x + b.w / 2, cy = b.y;
     this.particles.push({ type: "text", text: "+1", x: cx, y: cy, vy: -60, life: 0.8, max: 0.8 });
-    for (let i = 0; i < 7; i++) {
+    const burst = this.character.sparkleTrail ? 14 : 7; // crystals burst bigger
+    for (let i = 0; i < burst; i++) {
       const a = rand(0, Math.PI * 2);
       this.particles.push({
         type: "spark", x: cx, y: cy + b.h / 2,
         vx: Math.cos(a) * rand(60, 140), vy: Math.sin(a) * rand(60, 140),
-        life: 0.5, max: 0.5, color: choose(["#ffe066", "#b6f07a", "#ffffff"]),
+        life: 0.5, max: 0.5, color: choose(this.character.sparkColors),
       });
     }
     if (this.count >= CONFIG.WIN_TARGET) {
@@ -2829,8 +3428,12 @@ class Game {
       this.drawShowcase(ctx);
       return;
     }
+    if (this.state === "select") {
+      this.drawSelect(ctx);
+      return;
+    }
     this.background.draw(ctx, this.palette);
-    for (const b of this.bamboos) b.draw(ctx);
+    for (const b of this.bamboos) b.draw(ctx, this.character, this.time);
     for (const h of this.pickups) h.draw(ctx);
     for (const o of this.obstacles) o.draw(ctx, this.time);
 
@@ -2844,7 +3447,7 @@ class Game {
       this.panda.y = CONFIG.GROUND_Y - Math.abs(Math.sin((this.time - this.endTime) * 6)) * 28;
     }
     if (this.flashHidden) ctx.globalAlpha = 0.25; // blink while invincible
-    this.panda.draw(ctx, mode, this.time);
+    this.panda.draw(ctx, mode, this.time, this.character);
     ctx.globalAlpha = 1;
 
     this.drawParticles(ctx);
@@ -2875,7 +3478,7 @@ class Game {
       } else if (p.type === "banner") {
         drawText(ctx, p.text, p.x, p.y, 36, "#ffffff", { stroke: "#d35400", strokeWidth: 6 });
       } else {
-        drawStar(ctx, p.x, p.y, 4, p.color);
+        drawStar(ctx, p.x, p.y, p.size || 4, p.color);
       }
     }
     ctx.globalAlpha = 1;
@@ -2886,8 +3489,10 @@ class Game {
       ctx.save();
       ctx.translate(c.x, c.y);
       ctx.rotate(c.rot);
-      if (c.leaf) {
-        ellipse(ctx, 0, 0, 9, 3.5, 0, "#5cae43", "#2f6b1a", 1);
+      if (c.special && this.character.id === "panda") {
+        ellipse(ctx, 0, 0, 9, 3.5, 0, "#5cae43", "#2f6b1a", 1); // bamboo leaf
+      } else if (c.special) {
+        this.character.drawCollectible(ctx, 0, -9, 18, this.time, c.variant); // mini bone / crystal
       } else {
         ctx.fillStyle = c.color;
         ctx.fillRect(-4, -2.5, 8, 5);
@@ -2903,8 +3508,8 @@ class Game {
     ctx.fillStyle = "rgba(255,255,255,0.8)";
     ctx.fill();
     ctx.restore();
-    drawBambooStalk(ctx, 34, 16, 40);
-    drawText(ctx, `${this.count} / ${CONFIG.WIN_TARGET}`, 58, 30, 24, "#2f5d1a", { align: "left" });
+    this.character.drawCollectible(ctx, 34, 16, 40, this.time, 1);
+    drawText(ctx, `${this.count} / ${CONFIG.WIN_TARGET}`, 58, 30, 24, this.character.accent, { align: "left" });
 
     // Progress bar toward the goal
     const bx = 58, by = 46, bw = 140, bh = 12;
@@ -2992,7 +3597,7 @@ class Game {
     drawBambooStalk(ctx, 318, 48, 46);
     drawBambooStalk(ctx, 722, 48, 46);
     drawPanel(ctx, 320, 120, 400, 170);
-    drawText(ctx, "↑ Jump,  ↓ Duck,  collect 50 bamboo!", 520, 152, 20, "#2f5d1a");
+    drawText(ctx, `↑ Jump,  ↓ Duck,  collect ${CONFIG.WIN_TARGET} ${this.character.collectible.many}!`, 520, 152, 19, "#2f5d1a");
     drawText(ctx, "Jump over rocks  •  Duck under branches", 520, 184, 15, "#555");
     drawText(ctx, `Hold ↓ in the air to drop faster  •  ${CONFIG.START_LIVES} lives`, 520, 206, 15, "#555");
     drawText(ctx, "P / Esc pause  •  M mute  •  H hitboxes  •  O gallery", 520, 228, 13, "#777");
@@ -3010,23 +3615,26 @@ class Game {
   }
 
   drawGameOver(ctx) {
-    drawPanel(ctx, 160, 70, 480, 180);
-    drawText(ctx, `Oops! The panda ${this.hitMessage}!`, 400, 105, 22, "#c0392b");
-    drawText(ctx, `Bamboo this run: ${this.count}`, 400, 145, 20, "#2f5d1a");
-    drawText(ctx, `Best this session: ${this.bestScore}`, 400, 175, 18, "#555");
+    const many = this.character.collectible.many;
+    drawPanel(ctx, 150, 60, 500, 200);
+    drawText(ctx, `Oops! ${capitalize(this.character.the)} ${this.hitMessage}!`, 400, 95, 21, "#c0392b");
+    drawText(ctx, `${capitalize(many)} this run: ${this.count}`, 400, 135, 20, this.character.accent);
+    drawText(ctx, `Best this session: ${this.bestScore}`, 400, 165, 18, "#555");
     if (this.time - this.endTime > CONFIG.RESTART_DELAY && Math.floor(this.time * 2) % 2 === 0) {
-      drawText(ctx, "Press Space to try again", 400, 220, 20, "#d35400");
+      drawText(ctx, "Press Space to try again", 400, 207, 20, "#d35400");
     }
+    drawText(ctx, "C: choose another character", 400, 238, 14, "#777");
   }
 
   drawWin(ctx) {
-    drawPanel(ctx, 190, 70, 420, 170);
-    drawText(ctx, "🎉", 400, 100, 26, "#000");
-    drawText(ctx, `You collected ${CONFIG.WIN_TARGET} bamboo! You win!`, 400, 140, 22, "#2f7d1a");
-    drawText(ctx, `Best this session: ${this.bestScore}`, 400, 172, 17, "#555");
+    drawPanel(ctx, 150, 60, 500, 196);
+    drawText(ctx, "🎉", 400, 90, 26, "#000");
+    drawText(ctx, `You collected ${CONFIG.WIN_TARGET} ${this.character.collectible.many}! You win!`, 400, 128, 21, this.character.accent);
+    drawText(ctx, `Best this session: ${this.bestScore}`, 400, 160, 17, "#555");
     if (this.time - this.endTime > CONFIG.RESTART_DELAY && Math.floor(this.time * 2) % 2 === 0) {
-      drawText(ctx, "Press Space to play again", 400, 210, 20, "#d35400");
+      drawText(ctx, "Press Space to play again", 400, 200, 20, "#d35400");
     }
+    drawText(ctx, "C: choose another character", 400, 232, 14, "#777");
   }
 
   // Hitbox outlines (press H)
@@ -3041,20 +3649,68 @@ class Game {
       CONFIG.WIDTH - 14, 66, 12, "#b00020", { align: "right" });
   }
 
+  // Character Select: three cards, the highlighted one glows and bounces.
+  drawSelect(ctx) {
+    this.background.draw(ctx, this.palette);
+    ctx.fillStyle = "rgba(20,40,20,0.25)";
+    ctx.fillRect(0, 0, CONFIG.WIDTH, CONFIG.HEIGHT);
+    drawText(ctx, "Choose your runner", 400, 34, 32, "#ffffff", { stroke: "#2f6b1a", strokeWidth: 8 });
+    CHARACTERS.forEach((c, i) => {
+      const r = this.selectCard(i);
+      const on = i === this.selectIndex;
+      const cx = r.x + r.w / 2;
+      ctx.save();
+      if (on) {
+        ctx.shadowColor = "#ffd23f";
+        ctx.shadowBlur = 22 + Math.sin(this.time * 5) * 6;
+      }
+      roundRectPath(ctx, r.x, r.y, r.w, r.h, 18);
+      ctx.fillStyle = on ? "rgba(255,253,240,0.97)" : "rgba(255,253,240,0.75)";
+      ctx.fill();
+      ctx.restore();
+      roundRectPath(ctx, r.x, r.y, r.w, r.h, 18);
+      ctx.lineWidth = on ? 4 : 2;
+      ctx.strokeStyle = on ? "#f0b400" : "rgba(76,138,46,0.6)";
+      ctx.stroke();
+      drawText(ctx, String(i + 1), r.x + 18, r.y + 20, 14, "#999");
+      // Little patch of grass to stand on
+      ellipse(ctx, cx, r.y + 196, 60, 8, 0, "rgba(95,156,58,0.35)");
+      const hop = on ? Math.abs(Math.sin(this.time * 5)) * 10 : 0;
+      ctx.save();
+      ctx.translate(cx, r.y + 196 - hop);
+      ctx.scale(1.3, 1.3);
+      c.poses.idle(ctx, this.time + i * 0.7);
+      ctx.restore();
+      drawText(ctx, c.name, cx, r.y + 222, 22, c.accent);
+      // "collects ..." line with the collectible icon just left of the text
+      const label = `collects ${c.collectible.many}`;
+      ctx.font = `bold 14px ${CONFIG.FONT}`;
+      const tw = ctx.measureText(label).width;
+      c.drawCollectible(ctx, cx - (tw + 16) / 2 + 4, r.y + 236, 22, this.time, i);
+      drawText(ctx, label, cx + 8, r.y + 247, 14, "#555");
+    });
+    drawText(ctx, "← → to choose, Space to start", 400, 356, 20, "#ffffff", { stroke: "#2f5d1a", strokeWidth: 5 });
+    drawText(ctx, "or press 1 / 2 / 3, or click a character", 400, 381, 13, "#ffffff", { stroke: "#2f5d1a", strokeWidth: 4 });
+  }
+
   // The "O" gallery: one item at a time, in its zone's scenery, with hitboxes.
   drawShowcase(ctx) {
     const z = ZONES[this.showcaseZone] || ZONES[0];
     this.background.draw(ctx, blendPalettes(z, z, 0));
     const item = this.showcaseItem;
+    const total = OBSTACLE_TYPES.length + 1 + CHARACTERS.length;
+    const outline = (b, color) => { ctx.lineWidth = 1.5; ctx.strokeStyle = color; ctx.strokeRect(b.x, b.y, b.w, b.h); };
+    if (item.characterPage) {
+      this.drawCharacterPage(ctx, item.characterPage, total, outline);
+      return;
+    }
     item.draw(ctx, this.time);
-    this.panda.draw(ctx, "idle", this.time); // for size comparison
+    this.panda.draw(ctx, "idle", this.time, this.character); // for size comparison
     ctx.lineWidth = 1.5;
-    const outline = (b, color) => { ctx.strokeStyle = color; ctx.strokeRect(b.x, b.y, b.w, b.h); };
     outline(this.panda.getHitbox(), "#00c853");
     if (item instanceof HeartPickup) outline(item.getHitbox(), "#ff4fa3");
     else for (const b of item.getHitboxes()) outline(b, "#ff1744");
 
-    const total = OBSTACLE_TYPES.length + 1;
     drawPanel(ctx, 12, 10, 330, 124);
     let title, line2, line3, line4;
     if (item instanceof HeartPickup) {
@@ -3073,6 +3729,40 @@ class Game {
     drawText(ctx, line2, 26, 55, 13, "#555", { align: "left" });
     drawText(ctx, line3, 26, 74, 12, "#555", { align: "left" });
     drawText(ctx, line4, 26, 92, 12, "#555", { align: "left" });
+    drawText(ctx, "O next  •  Shift+O back  •  Esc exit", 26, 116, 12, "#d35400", { align: "left" });
+  }
+
+  // Gallery page for one character: every pose with the shared hitbox,
+  // plus its collectible (3 variants) with the shared collectible hitbox.
+  drawCharacterPage(ctx, c, total, outline) {
+    const gy = CONFIG.GROUND_Y, C = CONFIG;
+    const poses = [
+      ["run 1", (x) => c.poses.run(x, 0, this.time)], ["run 2", (x) => c.poses.run(x, 1, this.time)],
+      ["run 3", (x) => c.poses.run(x, 2, this.time)], ["run 4", (x) => c.poses.run(x, 3, this.time)],
+      ["jump", (x) => c.poses.jump(x, this.time), 50], ["duck", (x) => c.poses.duck(x, 0, this.time), 0, true],
+      ["dizzy", (x) => c.poses.dizzy(x, this.time)], ["happy", (x) => c.poses.happy(x, this.time)],
+    ];
+    poses.forEach(([label, draw, lift = 0, duck = false], i) => {
+      const x = 52 + i * 80, feet = gy - lift;
+      ctx.save();
+      ctx.translate(x, feet);
+      draw(ctx);
+      ctx.restore();
+      const w = duck ? C.PANDA_DUCK_WIDTH : C.PANDA_WIDTH, h = duck ? C.PANDA_DUCK_HEIGHT : C.PANDA_HEIGHT;
+      outline(insetBox(x - w / 2, feet - h, w, h), "#00c853");
+      drawText(ctx, label, x, gy + 22, 12, "#ffffff", { stroke: "#333", strokeWidth: 3 });
+    });
+    for (let v = 0; v < 3; v++) {
+      const bx = 700 + v * 30;
+      c.drawCollectible(ctx, bx, gy - C.BAMBOO_GROUND_HEIGHT - C.BAMBOO_HEIGHT, C.BAMBOO_HEIGHT, this.time, v);
+      outline(insetBox(bx - C.BAMBOO_WIDTH / 2, gy - C.BAMBOO_GROUND_HEIGHT - C.BAMBOO_HEIGHT, C.BAMBOO_WIDTH, C.BAMBOO_HEIGHT), "#ffab00");
+    }
+    drawText(ctx, c.collectible.many, 730, gy + 22, 12, "#ffffff", { stroke: "#333", strokeWidth: 3 });
+    drawPanel(ctx, 12, 10, 330, 124);
+    drawText(ctx, `${this.showcaseIndex + 1} / ${total}   ${c.name}: every pose`, 26, 32, 16, c.accent, { align: "left" });
+    drawText(ctx, `Collects ${c.collectible.many}`, 26, 55, 13, "#555", { align: "left" });
+    drawText(ctx, "Green: shared player hitbox (same for all)", 26, 74, 12, "#555", { align: "left" });
+    drawText(ctx, "Orange: shared collectible hitbox", 26, 92, 12, "#555", { align: "left" });
     drawText(ctx, "O next  •  Shift+O back  •  Esc exit", 26, 116, 12, "#d35400", { align: "left" });
   }
 }
@@ -3187,6 +3877,14 @@ window.addEventListener("keydown", (e) => {
   game.onKeyDown(e);
 });
 window.addEventListener("keyup", (e) => game.onKeyUp(e));
+
+// Mouse / touch: click a character on the Character Select screen
+canvas.addEventListener("pointerdown", (e) => {
+  sound.unlock();
+  const r = canvas.getBoundingClientRect();
+  game.onClick(((e.clientX - r.left) / r.width) * CONFIG.WIDTH, ((e.clientY - r.top) / r.height) * CONFIG.HEIGHT);
+  canvas.focus();
+});
 
 // Auto-pause when the tab or window loses focus
 window.addEventListener("blur", () => game.onBlur());
