@@ -59,7 +59,6 @@ const CONFIG = {
   GROUND_Y: 340,             // y coordinate of the ground surface
 
   // --- Goal ---
-  WIN_TARGET: 50,            // bamboo sticks needed to win
 
   // --- Panda size & physics ---
   PANDA_X: 170,              // fixed horizontal position (left third of screen)
@@ -104,6 +103,7 @@ const CONFIG = {
   GAP_MIN_WIDTH: 50,         // narrowest gap in the ground
   GAP_MAX_WIDTH: 130,        // widest gap (checked to be jumpable at the slowest speed)
   GAP_LANDING_BONUS: 0.35,   // extra seconds of empty ground after a gap
+  TALL_ROCK_LEAD_BONUS: 0.35,// extra seconds before a tall rock (a double jump must start earlier)
   GAP_FALL_TIME: 0.6,        // how long the "falling into the hole" animation lasts
   BOULDER_EXTRA_SPEED: 100,  // rolling boulders roll this much faster than the ground
   SWOOP_EXTRA_SPEED: 50,     // swooping birds fly this much faster than the ground
@@ -170,6 +170,7 @@ const CONFIG = {
 
 /* =====================================================================
    LEVELS - settings for each level. Add an entry to add a level.
+     target                            - collectibles needed to finish the level
      startSpeed / speedStep / maxSpeed - scroll speed (px/s); speed goes up
                                          by speedStep every SPEED_STEP_EVERY
      randomGap / randomGapShrink       - random extra spacing between obstacles
@@ -183,15 +184,16 @@ const CONFIG = {
    ===================================================================== */
 const LEVELS = [
   {
-    name: "Level 1",
+    name: "Level 1", target: 50,
     startSpeed: 320, speedStep: 40, maxSpeed: 560,
     randomGap: 1.2, randomGapShrink: 0.15,
     musicBpm: 152, skyTint: null,
     unlockAll: false, comboChance: 0, comboGap: 0.85, intro: [],
   },
   {
-    name: "Level 2",
-    startSpeed: 360, speedStep: 40, maxSpeed: 560,
+    name: "Level 2", target: 200,
+    // Caps at 520 px/s (reached at 40 items) and stays there for the rest of the level
+    startSpeed: 360, speedStep: 40, maxSpeed: 520,
     randomGap: 1.0, randomGapShrink: 0.12,
     musicBpm: 172, skyTint: { top: "rgba(70,35,120,0.45)", bottom: "rgba(255,120,90,0.22)" }, // dusk
     unlockAll: true, comboChance: 0.2, comboGap: 0.85,
@@ -3258,7 +3260,7 @@ class Game {
 
   // Collected over the whole game (for "best this session")
   get totalCollected() {
-    return this.levelIndex * CONFIG.WIN_TARGET + this.count;
+    return LEVELS.slice(0, this.levelIndex).reduce((sum, L) => sum + L.target, 0) + this.count;
   }
 
   get character() {
@@ -3404,7 +3406,7 @@ class Game {
     this.start(0);
   }
 
-  // Collected WIN_TARGET in a level that is not the last one
+  // Reached the level's target in a level that is not the last one
   levelComplete() {
     this.state = "levelcomplete";
     this.endTime = this.time;
@@ -3634,6 +3636,7 @@ class Game {
       gapTime = CONFIG.MIN_OBSTACLE_GAP + rand(0, randomPart);
       if (next.kind !== type.kind) gapTime += CONFIG.MIXED_GAP_BONUS; // jump<->duck needs a bit more time
       if (type.isGap) gapTime += CONFIG.GAP_LANDING_BONUS;            // clear ground after a gap
+      if (next.needsDoubleJump) gapTime += CONFIG.TALL_ROCK_LEAD_BONUS; // room to take off early
     }
     // Convert time to pixels. We use the speed one step faster than now, in
     // case the player speeds up before reaching the next obstacle; that way
@@ -3947,7 +3950,7 @@ class Game {
         life: 0.5, max: 0.5, color: choose(this.character.sparkColors),
       });
     }
-    if (this.count >= CONFIG.WIN_TARGET) {
+    if (this.count >= this.level.target) {
       // Last level: you win. Otherwise: on to the next level.
       if (this.levelIndex < LEVELS.length - 1) this.levelComplete();
       else this.win();
@@ -4108,7 +4111,7 @@ class Game {
     ctx.fill();
     ctx.restore();
     this.character.drawCollectible(ctx, 34, 16, 40, this.time, 1);
-    drawText(ctx, `${this.count} / ${CONFIG.WIN_TARGET}`, 58, 30, 24, this.character.accent, { align: "left" });
+    drawText(ctx, `${this.count} / ${this.level.target}`, 58, 30, 24, this.character.accent, { align: "left" });
     drawText(ctx, this.level.name, 242, 30, 14, "#555", { align: "right" });
 
     // Progress bar toward the goal
@@ -4116,7 +4119,7 @@ class Game {
     roundRectPath(ctx, bx, by, bw, bh, 6);
     ctx.fillStyle = "#dfe8d4";
     ctx.fill();
-    const frac = Math.min(1, this.count / CONFIG.WIN_TARGET);
+    const frac = Math.min(1, this.count / this.level.target);
     if (frac > 0) {
       roundRectPath(ctx, bx, by, Math.max(bh, bw * frac), bh, 6);
       ctx.fillStyle = "#5fb83a";
@@ -4197,7 +4200,7 @@ class Game {
     drawBambooStalk(ctx, 318, 48, 46);
     drawBambooStalk(ctx, 722, 48, 46);
     drawPanel(ctx, 320, 120, 400, 170);
-    drawText(ctx, `↑ Jump,  ↓ Duck,  collect ${CONFIG.WIN_TARGET} ${this.character.collectible.many}!`, 520, 152, 19, "#2f5d1a");
+    drawText(ctx, `↑ Jump,  ↓ Duck,  collect ${LEVELS[0].target} ${this.character.collectible.many}!`, 520, 152, 19, "#2f5d1a");
     drawText(ctx, "Jump over rocks  •  Duck under branches  •  ↑↑ double jump", 520, 184, 14, "#555");
     drawText(ctx, `Hold ↓ in the air to drop faster  •  ${CONFIG.START_LIVES} lives`, 520, 206, 15, "#555");
     drawText(ctx, "P / Esc pause  •  M mute  •  H hitboxes  •  O gallery  •  L Level 2", 520, 228, 12, "#777");
@@ -4230,7 +4233,7 @@ class Game {
   drawWin(ctx) {
     drawPanel(ctx, 200, 72, 500, 206);
     drawText(ctx, `🎉 You beat ${this.level.name}! 🎉`, 450, 106, 26, "#c0392b");
-    drawText(ctx, `You collected ${CONFIG.WIN_TARGET} ${this.character.collectible.many}! You win!`, 450, 146, 21, this.character.accent);
+    drawText(ctx, `You collected ${this.level.target} ${this.character.collectible.many}! You win!`, 450, 146, 21, this.character.accent);
     drawText(ctx, `Best this session: ${this.bestScore} in total`, 450, 180, 16, "#555");
     if (this.time - this.endTime > CONFIG.RESTART_DELAY && Math.floor(this.time * 2) % 2 === 0) {
       drawText(ctx, "Press Space to play again", 450, 222, 20, "#d35400");
@@ -4261,7 +4264,7 @@ class Game {
     ctx.scale(0.6 + 0.4 * pop, 0.6 + 0.4 * pop);
     drawText(ctx, `${this.level.name} Complete!`, 0, 0, 34, "#ffffff", { stroke: this.character.accent, strokeWidth: 8 });
     ctx.restore();
-    drawText(ctx, `You collected ${CONFIG.WIN_TARGET} ${this.character.collectible.many}!`, 450, 156, 18, "#555");
+    drawText(ctx, `You collected ${this.level.target} ${this.character.collectible.many}!`, 450, 156, 18, "#555");
     if (t > 0.8) {
       drawText(ctx, `${next.name}: Get ready!`, 450, 192, 24, "#c0392b");
       const bonus = this.lives < CONFIG.MAX_LIVES;
