@@ -73,20 +73,16 @@ const CONFIG = {
   JUMP_BUFFER_TIME: 0.12,    // a jump pressed this long before landing still counts
   RUN_ANIM_FPS: 12,          // leg animation speed at the starting scroll speed
 
-  // --- Scroll speed / difficulty ---
-  START_SPEED: 320,          // starting scroll speed (px/s)
-  SPEED_STEP: 40,            // speed added at each difficulty step
+  // --- Scroll speed / difficulty (per-level speeds live in LEVELS below) ---
   SPEED_STEP_EVERY: 10,      // a difficulty step happens every N bamboo
-  MAX_SPEED: 560,            // speed never goes above this
+  MAX_SPEED: 560,            // absolute speed cap; the fairness checks use it
   TITLE_SCROLL_SPEED: 60,    // gentle background scroll on the title screen
 
   // --- Obstacle spawning (all gaps are measured in seconds of travel time) ---
   FIRST_OBSTACLE_DELAY: 1.8, // seconds before the very first obstacle
   MIN_OBSTACLE_GAP: 1.0,     // GUARANTEED minimum time between two obstacles
   MIXED_GAP_BONUS: 0.3,      // extra time when a rock and a branch follow each other
-  RANDOM_GAP: 1.2,           // up to this much random extra time between obstacles
-  RANDOM_GAP_SHRINK: 0.15,   // random extra shrinks by this much per difficulty step
-  RANDOM_GAP_MIN: 0.35,      // ...but never below this
+  RANDOM_GAP_MIN: 0.35,      // random extra gap never below this (per-level values in LEVELS)
   OVERHEAD_CHANCE: 0.4,      // probability that an obstacle is overhead (duck) rather than ground (jump)
   GROUND_OBSTACLE_MAX_HEIGHT: 36, // safe height limit for anything you jump over
 
@@ -101,6 +97,23 @@ const CONFIG = {
   LAVA_MIN_WIDTH: 60,        // narrowest lava pit
   LAVA_MAX_WIDTH: 110,       // widest lava pit (checked to be jumpable at top speed)
   BIRD_EXTRA_SPEED: 70,      // birds fly this much faster than the ground scrolls (px/s)
+
+  // --- Double jump and Level 2 hazards ---
+  DOUBLE_JUMP_VELOCITY: 640, // second (smaller) jump in mid-air
+  TALL_ROCK_HEIGHT: 160,     // tall rock stacks: too tall for one jump, fine for a double jump
+  GAP_MIN_WIDTH: 50,         // narrowest gap in the ground
+  GAP_MAX_WIDTH: 130,        // widest gap (checked to be jumpable at the slowest speed)
+  GAP_LANDING_BONUS: 0.35,   // extra seconds of empty ground after a gap
+  GAP_FALL_TIME: 0.6,        // how long the "falling into the hole" animation lasts
+  BOULDER_EXTRA_SPEED: 100,  // rolling boulders roll this much faster than the ground
+  SWOOP_EXTRA_SPEED: 50,     // swooping birds fly this much faster than the ground
+  SWOOP_AMPLITUDE: 55,       // how far up the swooping bird rises from its lowest point
+  SWOOP_SPEED: 2.6,          // how fast it swoops up and down
+  FALL_WARNING: 1.0,         // the shadow appears this many seconds before something lands
+  FALL_TIME: 0.65,           // time from the top of the screen to the ground
+  FALL_LINGER: 0.45,         // it stays (and hurts) this long after landing, then breaks
+  FALL_BREAK_TIME: 0.35,     // length of the break-apart animation
+  LEVEL_COMPLETE_DELAY: 1.6, // seconds before Space continues from "Level Complete"
 
   // --- Zones (spring -> autumn -> snow -> desert -> volcano) ---
   ZONES_ENABLED: true,       // false = spring scenery and all obstacle styles mixed together
@@ -153,6 +166,38 @@ const CONFIG = {
   RESTART_DELAY: 0.5,        // seconds before Space can restart after win / loss
   FONT: "'Trebuchet MS', 'Segoe UI', Verdana, sans-serif",
 };
+
+
+/* =====================================================================
+   LEVELS - settings for each level. Add an entry to add a level.
+     startSpeed / speedStep / maxSpeed - scroll speed (px/s); speed goes up
+                                         by speedStep every SPEED_STEP_EVERY
+     randomGap / randomGapShrink       - random extra spacing between obstacles
+     musicBpm                          - music tempo
+     skyTint                           - color wash over the sky (null = none)
+     unlockAll                         - all earlier obstacles available at once
+     comboChance                       - chance of a designed jump+duck combo
+     comboGap                          - seconds between the two combo halves
+     intro                             - new things introduced one at a time,
+                                         with a normal obstacle in between
+   ===================================================================== */
+const LEVELS = [
+  {
+    name: "Level 1",
+    startSpeed: 320, speedStep: 40, maxSpeed: 560,
+    randomGap: 1.2, randomGapShrink: 0.15,
+    musicBpm: 152, skyTint: null,
+    unlockAll: false, comboChance: 0, comboGap: 0.85, intro: [],
+  },
+  {
+    name: "Level 2",
+    startSpeed: 360, speedStep: 40, maxSpeed: 560,
+    randomGap: 1.0, randomGapShrink: 0.12,
+    musicBpm: 172, skyTint: { top: "rgba(70,35,120,0.45)", bottom: "rgba(255,120,90,0.22)" }, // dusk
+    unlockAll: true, comboChance: 0.2, comboGap: 0.85,
+    intro: ["tallrock", "gap", "boulder", "swoopbird", "falling", "combo"],
+  },
+];
 
 
 /* =====================================================================
@@ -411,6 +456,13 @@ class Sound {
   thud()    { this.tone(170, 45, 0.3, "square", 0.14);                       // "thud"
               this.tone(95, 40, 0.35, "sine", 0.4); }
   levelUp() { this.tone(660, 990, 0.15, "triangle", 0.12); }
+  doubleJump() { this.tone(520, 1040, 0.12, "triangle", 0.2);                // "whoosh-ping"
+                 this.tone(1568, 2093, 0.1, "sine", 0.1, 0.05); }
+  fall()    { this.tone(700, 140, 0.5, "sine", 0.22); }                      // falling into a gap
+  levelComplete() {
+    [659, 784, 988, 1319].forEach((f, i) => this.tone(f, f, 0.13, "square", 0.12, i * 0.1));
+    [784, 988, 1319].forEach((f) => this.tone(f, f, 0.5, "triangle", 0.12, 0.42));
+  }
   powerUp() {                                                                 // heart pickup
     [523, 659, 784, 1047].forEach((f, i) => this.tone(f, f * 1.02, 0.12, "square", 0.12, i * 0.06));
     this.tone(1568, 2093, 0.25, "triangle", 0.12, 0.24);
@@ -512,7 +564,7 @@ class Music {
   }
 
   get stepLength() {
-    return 60 / CONFIG.MUSIC_BPM / 2; // one eighth note, in seconds
+    return 60 / (this.bpm || CONFIG.MUSIC_BPM) / 2; // one eighth note, in seconds (bpm set per level)
   }
 
   // Start from the beginning of the song.
@@ -649,6 +701,8 @@ class Panda {
     this.onGround = true;
     this.wantsDuck = false;   // is the Down key held?
     this.jumpBuffer = 0;      // time left on a pending jump request
+    this.doubleJumped = false; // used the mid-air jump? (resets on landing)
+    this.didDoubleJump = false; // tells the game to play the puff + sound
     this.animTime = 0;        // drives the running animation
   }
 
@@ -657,9 +711,16 @@ class Panda {
     return this.onGround && this.wantsDuck;
   }
 
-  // Ask for a jump. It happens on the next update if he is on the ground
-  // (or within JUMP_BUFFER_TIME once he lands). No double jumps.
+  // Ask for a jump. On the ground it happens on the next update (or within
+  // JUMP_BUFFER_TIME once he lands). In the air it is a double jump: a
+  // second, smaller jump, once per jump.
   requestJump() {
+    if (!this.onGround && !this.doubleJumped && this.y < CONFIG.GROUND_Y - 4) {
+      this.vy = -CONFIG.DOUBLE_JUMP_VELOCITY;
+      this.doubleJumped = true;
+      this.didDoubleJump = true;
+      return;
+    }
     this.jumpBuffer = CONFIG.JUMP_BUFFER_TIME;
   }
 
@@ -695,6 +756,7 @@ class Panda {
         this.y = CONFIG.GROUND_Y;
         this.vy = 0;
         this.onGround = true;
+        this.doubleJumped = false;
       }
     }
     return jumped;
@@ -1658,6 +1720,80 @@ function drawBee(ctx, x, y, dir, t) {
   ellipse(ctx, x + dir * 4, y - 0.5, 0.9, 0.9, 0, "#222");
 }
 
+/* ---------- Shared helpers: moving and falling hazards ---------- */
+
+// How much faster than the ground an obstacle moves (0 for most).
+function extraSpeedOf(type) {
+  if (type.extraSpeed) return type.extraSpeed();
+  return type.movesFaster ? CONFIG.BIRD_EXTRA_SPEED : 0;
+}
+
+// Swooping bird: bottom edge rises and dips in a wave. Its lowest point is
+// exactly BRANCH_CLEARANCE above the ground (duckable, like a branch).
+function swoopBottom(o) {
+  return CONFIG.GROUND_Y - CONFIG.BRANCH_CLEARANCE -
+    CONFIG.SWOOP_AMPLITUDE * (0.5 + 0.5 * Math.cos(o.age * CONFIG.SWOOP_SPEED));
+}
+
+// Falling hazards: o.x is the ground spot where it will land (it scrolls
+// with the ground). o.landX is the screen x where it touches down, which
+// the game sets ahead of the player. o.timeToLand counts down to landing.
+function makeFalling(o, w, h) {
+  o.w = w;
+  o.h = h;
+  o.landX = CONFIG.PANDA_X + 150;
+  o.timeToLand = 99;
+  o.landedFor = 0;
+}
+
+// y of its bottom edge: above the screen until FALL_TIME before landing,
+// then speeding up as it drops.
+function fallingBottom(o) {
+  if (o.timeToLand <= 0) return CONFIG.GROUND_Y;
+  const k = Math.min(1.2, o.timeToLand / CONFIG.FALL_TIME);
+  return CONFIG.GROUND_Y - (CONFIG.GROUND_Y + o.h + 20) * k * k;
+}
+
+// Solid while falling and for FALL_LINGER after landing, then gone.
+function fallingBoxes(o) {
+  if (o.timeToLand > CONFIG.FALL_TIME || o.landedFor > CONFIG.FALL_LINGER) return [];
+  const b = fallingBottom(o);
+  return [{ x: 0, y: b - o.h, w: o.w, h: o.h }];
+}
+
+// Shadow warning, the falling object, then pieces when it breaks.
+function drawFalling(ctx, o, pieceColor, drawThing) {
+  const gy = CONFIG.GROUND_Y, cx = o.x + o.w / 2;
+  const broken = o.landedFor > CONFIG.FALL_LINGER;
+  if (!broken && o.timeToLand <= CONFIG.FALL_WARNING) {
+    // Shadow: appears FALL_WARNING seconds before landing, darker as it nears
+    const k = Math.max(0, Math.min(1, 1 - o.timeToLand / CONFIG.FALL_WARNING));
+    ellipse(ctx, cx, gy + 2, o.w * (0.35 + 0.4 * k), 2.5 + 2.5 * k, 0, `rgba(0,0,0,${0.12 + 0.45 * k})`);
+  }
+  if (!broken && o.timeToLand <= CONFIG.FALL_TIME) {
+    const bottom = fallingBottom(o);
+    if (o.timeToLand > 0) {
+      // Speed lines above it while falling
+      ctx.strokeStyle = "rgba(255,255,255,0.6)";
+      ctx.lineWidth = 1.5;
+      for (const dx of [-4, 0, 4]) {
+        ctx.beginPath();
+        ctx.moveTo(cx + dx, bottom - o.h - 4);
+        ctx.lineTo(cx + dx, bottom - o.h - 16);
+        ctx.stroke();
+      }
+    }
+    drawThing(o.x, bottom);
+  }
+  if (broken && o.landedFor < CONFIG.FALL_LINGER + CONFIG.FALL_BREAK_TIME) {
+    const p = (o.landedFor - CONFIG.FALL_LINGER) / CONFIG.FALL_BREAK_TIME;
+    for (let i = 0; i < 6; i++) {
+      const dir = i % 2 ? 1 : -1, spread = 6 + i * 3;
+      ellipse(ctx, cx + dir * spread * p * 2, gy - o.h / 2 - p * 16 + p * p * 30 - i, 3.2 * (1 - p * 0.5), 2.4, i, pieceColor);
+    }
+  }
+}
+
 /* ---------- The registry ---------- */
 
 const OBSTACLE_TYPES = [
@@ -2490,13 +2626,226 @@ const OBSTACLE_TYPES = [
       ctx.restore();
     },
   },
+
+  /* ===== Level 2 obstacles (minLevel: 2) =====
+     Extra registry fields used here:
+       minLevel        - first level it can appear in
+       needsDoubleJump - too tall for one jump; checked against a double jump
+       isGap           - a hole: you fall in instead of bumping into it
+       falls           - drops from the sky onto a spot ahead of the player
+       extraSpeed()    - moves toward the player this much faster than the ground
+       noReward        - never put a bamboo / heart reward on it
+       hint            - shown on screen the first time it appears */
+  {
+    id: "rock-tall", name: "Tall rock stack", category: "tallrock", kind: "ground", label: "tall rock stack",
+    zones: ALL_ZONES, minBamboo: 0, minLevel: 2, needsDoubleJump: true, noReward: true,
+    hint: "Double jump! Press ↑ twice",
+    make(o) { o.w = 52; o.h = CONFIG.TALL_ROCK_HEIGHT; },
+    // Lower box: the two big boulders. Upper box: the narrower top of the stack.
+    boxes: (o) => [
+      { x: 0, y: CONFIG.GROUND_Y - 100, w: o.w, h: 100 },
+      { x: o.w * 0.12, y: CONFIG.GROUND_Y - o.h, w: o.w * 0.76, h: o.h - 100 },
+    ],
+    draw(ctx, o, t) {
+      const gy = CONFIG.GROUND_Y, x = o.x, w = o.w, h = o.h;
+      // [centre x, bottom, half-width (fractions of w / h), height fraction, color]
+      const stones = [[0.5, 0, 0.5, 0.25, "#8e939b"], [0.47, 0.25, 0.45, 0.26, "#a2a7ae"],
+                      [0.54, 0.5, 0.4, 0.25, "#959aa2"], [0.5, 0.74, 0.34, 0.26, "#b3b8be"]];
+      for (const [fx, fb, frx, fh, c] of stones) {
+        const cy = gy - h * fb - (h * fh) / 2;
+        ellipse(ctx, x + w * fx, cy, w * frx, (h * fh) / 2 + 1, 0, c, "#454b52", 2);
+        ellipse(ctx, x + w * fx - w * frx * 0.35, cy - h * fh * 0.22, w * frx * 0.28, h * fh * 0.1, -0.3, "rgba(255,255,255,0.35)");
+      }
+      // The first few times: a glowing double up-arrow on top (decoration)
+      if (o.showArrow) {
+        const ax = x + w / 2, ay = gy - h - 16 + Math.sin(t * 5) * 3;
+        ctx.save();
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.shadowColor = "#ffd23f";
+        ctx.shadowBlur = 10;
+        ctx.strokeStyle = "#ffd23f";
+        ctx.lineWidth = 4;
+        for (const k of [0, 10]) {
+          ctx.beginPath();
+          ctx.moveTo(ax - 9, ay + 6 - k); ctx.lineTo(ax, ay - 3 - k); ctx.lineTo(ax + 9, ay + 6 - k);
+          ctx.stroke();
+        }
+        ctx.restore();
+        drawStar(ctx, ax - 16, ay - 8 + Math.sin(t * 7) * 2, 3, "#fff6b0");
+        drawStar(ctx, ax + 15, ay - 14 + Math.cos(t * 6) * 2, 2.5, "#fff6b0");
+      }
+    },
+  },
+  {
+    id: "gap", name: "Gap in the ground", category: "gap", kind: "ground", label: "gap", message: "fell into a gap",
+    zones: ALL_ZONES, minBamboo: 0, minLevel: 2, isGap: true,
+    hint: "Gap! Jump across it",
+    make(o) { o.w = randInt(CONFIG.GAP_MIN_WIDTH, CONFIG.GAP_MAX_WIDTH); o.h = 12; },
+    // Only the middle of the hole counts, so you can stand right on the edges.
+    boxes: (o) => [{ x: 10, y: CONFIG.GROUND_Y - 12, w: o.w - 20, h: 50 }],
+    draw(ctx, o) {
+      const gy = CONFIG.GROUND_Y, x = o.x, w = o.w, H = CONFIG.HEIGHT;
+      const g = ctx.createLinearGradient(0, gy, 0, H);
+      g.addColorStop(0, "#22170f");
+      g.addColorStop(1, "#000000");
+      ctx.fillStyle = g;
+      ctx.fillRect(x, gy - 1, w, H - gy + 1);
+      // Earthy inner walls
+      ctx.fillStyle = "rgba(130,90,50,0.6)";
+      ctx.fillRect(x, gy, 5, H - gy);
+      ctx.fillRect(x + w - 5, gy, 5, H - gy);
+      // Bright rims on both edges so the hole is easy to read
+      ctx.fillStyle = "#f2e2b8";
+      ctx.fillRect(x - 2, gy - 2, 4, 6);
+      ctx.fillRect(x + w - 2, gy - 2, 4, 6);
+      ctx.strokeStyle = "rgba(0,0,0,0.5)";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x - 2, gy - 2, 4, 6);
+      ctx.strokeRect(x + w - 2, gy - 2, 4, 6);
+      // A few crumbs tumbling down (decoration)
+      for (let i = 0; i < 3; i++) ellipse(ctx, x + 10 + i * (w - 20) / 2, gy + 14 + i * 9, 1.6, 1.6, 0, "rgba(160,120,80,0.7)");
+    },
+  },
+  {
+    id: "boulder", name: "Rolling boulder", category: "boulder", kind: "ground", label: "rolling boulder",
+    zones: ALL_ZONES, minBamboo: 0, minLevel: 2, movesFaster: true, noReward: true,
+    extraSpeed: () => CONFIG.BOULDER_EXTRA_SPEED,
+    hint: "Rolling boulder! Jump over it",
+    make(o) { o.w = o.h = 34; o.travel = 0; },
+    boxes: groundBox,
+    draw(ctx, o) {
+      const r = o.w / 2, cx = o.x + r, cy = CONFIG.GROUND_Y - r;
+      // Dust kicked up behind it (decoration)
+      for (let i = 0; i < 3; i++) {
+        const p = ((o.travel / 40) + i / 3) % 1;
+        ellipse(ctx, cx + r + 4 + p * 22, CONFIG.GROUND_Y - 3 - p * 8, 3 + p * 5, 2 + p * 3, 0, `rgba(180,150,110,${0.45 * (1 - p)})`);
+      }
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.rotate(-o.travel / r); // rolling toward the player spins it this way
+      ellipse(ctx, 0, 0, r, r, 0, "#8f949b", "#3e4249", 2);
+      ctx.strokeStyle = "#5a6068";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(-r * 0.7, -r * 0.2); ctx.lineTo(r * 0.1, r * 0.1); ctx.lineTo(r * 0.5, r * 0.6);
+      ctx.moveTo(r * 0.1, r * 0.1); ctx.lineTo(r * 0.6, -r * 0.4);
+      ctx.stroke();
+      ellipse(ctx, -r * 0.35, r * 0.45, 3, 2.5, 0, "#6f757d");
+      ellipse(ctx, r * 0.4, -r * 0.55, 2.5, 2, 0, "#6f757d");
+      ctx.restore();
+      ellipse(ctx, cx - r * 0.35, cy - r * 0.42, r * 0.28, r * 0.16, -0.5, "rgba(255,255,255,0.35)");
+    },
+  },
+  {
+    id: "bird-swoop", name: "Swooping bird", category: "swoopbird", kind: "overhead", label: "swooping bird",
+    zones: ALL_ZONES, minBamboo: 0, minLevel: 2, movesFaster: true,
+    extraSpeed: () => CONFIG.SWOOP_EXTRA_SPEED,
+    hint: "Swooping bird! Duck under it",
+    make(o) { o.w = 46; o.bodyH = 28; o.age = 0; o.color = choose(["#f39c12", "#16a085", "#e84393"]); },
+    // It glides up and down in a wave, but its LOWEST point is still
+    // BRANCH_CLEARANCE above the ground, so ducking is always safe.
+    boxes(o) {
+      const b = swoopBottom(o);
+      return [{ x: 4, y: b - o.bodyH, w: o.w - 8, h: o.bodyH }];
+    },
+    draw(ctx, o, t) {
+      // Faint dotted line showing the wave it is flying along (decoration)
+      ctx.fillStyle = "rgba(255,255,255,0.45)";
+      for (let i = 1; i <= 5; i++) {
+        const back = { age: o.age - i * 0.09 };
+        ctx.fillRect(o.x + o.w + i * 9, swoopBottom(back) - 14, 3, 3);
+      }
+      OBSTACLE_BY_ID.bird.draw(ctx, { x: o.x, baseBottom: swoopBottom(o), age: 0, color: o.color }, t);
+    },
+  },
+  {
+    id: "fall-coconut", name: "Falling coconut", category: "falling", kind: "ground", label: "coconut",
+    message: "got bonked by a falling coconut",
+    zones: ["spring", "desert"], minBamboo: 0, minLevel: 2, falls: true, noReward: true,
+    hint: "Watch the shadow! Something is falling",
+    make: (o) => makeFalling(o, 22, 22),
+    boxes: fallingBoxes,
+    draw(ctx, o, t) {
+      drawFalling(ctx, o, "#6b4423", (x, bottom) => {
+        const r = o.w / 2;
+        ellipse(ctx, x + r, bottom - r, r, r, 0, "#7a4e2c", "#3e2611", 2);
+        ctx.strokeStyle = "rgba(60,35,15,0.6)";
+        ctx.lineWidth = 1;
+        for (let i = -1; i <= 1; i++) {
+          ctx.beginPath();
+          ctx.moveTo(x + r + i * 5, bottom - 2 * r + 3);
+          ctx.quadraticCurveTo(x + r + i * 7, bottom - r, x + r + i * 5, bottom - 3);
+          ctx.stroke();
+        }
+        for (const [dx, dy] of [[-3, -4], [3, -4], [0, 1]]) ellipse(ctx, x + r + dx, bottom - r * 1.4 + dy, 1.6, 1.6, 0, "#2a1608");
+      });
+    },
+  },
+  {
+    id: "fall-icicle", name: "Falling icicle", category: "falling", kind: "ground", label: "icicle",
+    message: "got bonked by a falling icicle",
+    zones: ["snow"], minBamboo: 0, minLevel: 2, falls: true, noReward: true,
+    hint: "Watch the shadow! Something is falling",
+    make: (o) => makeFalling(o, 14, 26),
+    boxes: fallingBoxes,
+    draw(ctx, o, t) {
+      drawFalling(ctx, o, "#cfe9ff", (x, bottom) => {
+        ctx.beginPath();
+        ctx.moveTo(x, bottom - o.h);
+        ctx.lineTo(x + o.w, bottom - o.h);
+        ctx.lineTo(x + o.w / 2, bottom);
+        ctx.closePath();
+        ctx.fillStyle = "#d6f0ff";
+        ctx.fill();
+        ctx.strokeStyle = "#7fb6e0";
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(x + 4, bottom - o.h + 3);
+        ctx.lineTo(x + o.w / 2, bottom - 5);
+        ctx.strokeStyle = "rgba(255,255,255,0.9)";
+        ctx.stroke();
+      });
+    },
+  },
+  {
+    id: "fall-rock", name: "Falling rock", category: "falling", kind: "ground", label: "rock",
+    message: "got bonked by a falling rock",
+    zones: ["autumn", "volcano"], minBamboo: 0, minLevel: 2, falls: true, noReward: true,
+    hint: "Watch the shadow! Something is falling",
+    make: (o) => makeFalling(o, 22, 20),
+    boxes: fallingBoxes,
+    draw(ctx, o, t) {
+      drawFalling(ctx, o, "#6d6a66", (x, bottom) => {
+        ctx.beginPath();
+        ctx.moveTo(x + 2, bottom - 4);
+        ctx.lineTo(x, bottom - 12);
+        ctx.lineTo(x + 7, bottom - o.h);
+        ctx.lineTo(x + 17, bottom - o.h + 1);
+        ctx.lineTo(x + o.w, bottom - 9);
+        ctx.lineTo(x + o.w - 3, bottom);
+        ctx.lineTo(x + 5, bottom);
+        ctx.closePath();
+        ctx.fillStyle = "#837d77";
+        ctx.fill();
+        ctx.strokeStyle = "#3e3a36";
+        ctx.lineWidth = 1.8;
+        ctx.stroke();
+        ellipse(ctx, x + 8, bottom - o.h + 6, 3.5, 2, -0.4, "rgba(255,255,255,0.35)");
+      });
+    },
+  },
 ];
 
 const OBSTACLE_BY_ID = Object.fromEntries(OBSTACLE_TYPES.map((t) => [t.id, t]));
 
 // How often each category is picked compared to the others (styles inside a
 // category share its weight equally).
-const CATEGORY_WEIGHTS = { rock: 2, branch: 2, log: 1, bush: 1, cactus: 1.2, lava: 1.2, beehive: 1, bird: 1 };
+const CATEGORY_WEIGHTS = {
+  rock: 2, branch: 2, log: 1, bush: 1, cactus: 1.2, lava: 1.2, beehive: 1, bird: 1,
+  tallrock: 0.8, gap: 1, boulder: 1, swoopbird: 0.9, falling: 1, // Level 2
+};
 
 class Obstacle {
   // type: a registry entry, an id like "rock-mossy", or a category like "rock"
@@ -2517,8 +2866,13 @@ class Obstacle {
 
   update(dt, speed) {
     this.age += dt;
-    const extra = this.type.movesFaster ? CONFIG.BIRD_EXTRA_SPEED : 0;
+    const extra = extraSpeedOf(this.type);
     this.x -= (speed + extra) * dt;
+    this.travel = (this.travel || 0) + (speed + extra) * dt; // for rolling
+    if (this.type.falls) {
+      this.timeToLand = (this.x - this.landX) / Math.max(1, speed);
+      if (this.timeToLand <= 0) this.landedFor += dt;
+    }
   }
 
   get offscreen() {
@@ -2753,8 +3107,8 @@ class Background {
     ctx.fill();
   }
 
-  // pal: a palette from blendPalettes()
-  draw(ctx, pal) {
+  // pal: a palette from blendPalettes(); tint: optional level sky tint
+  draw(ctx, pal, tint = null) {
     const W = CONFIG.WIDTH, H = CONFIG.HEIGHT, GY = CONFIG.GROUND_Y;
 
     // --- Layer 1 (far, slowest): sky, sun and misty mountains ---
@@ -2775,6 +3129,14 @@ class Background {
     mist.addColorStop(1, rgb(pal.mist, 0.55));
     ctx.fillStyle = mist;
     ctx.fillRect(0, 200, W, 100);
+    if (tint) {
+      // Level tint (e.g. dusk) over the sky and mountains
+      const tg = ctx.createLinearGradient(0, 0, 0, GY);
+      tg.addColorStop(0, tint.top);
+      tg.addColorStop(1, tint.bottom);
+      ctx.fillStyle = tg;
+      ctx.fillRect(0, 0, W, GY);
+    }
 
     // --- Layer 2 (middle): bamboo forest silhouette ---
     const fOff = this.layerOffset(CONFIG.PARALLAX_FOREST);
@@ -2847,6 +3209,7 @@ class Game {
     this.time = 0;          // total time, used for animations
     this.keys = new Set();  // keys currently held down
     this.fps = 60;
+    this.levelIndex = 0;     // 0 = Level 1, 1 = Level 2 (see LEVELS)
     this.characterIndex = 0; // chosen character (remembered for the session)
     this.selectIndex = 0;    // highlighted card on the Character Select screen
     this.trailTimer = 0;     // for the unicorn's sparkle trail
@@ -2876,10 +3239,26 @@ class Game {
     this.heartGainedAt = [];     // heartGainedAt[i] = time heart i was gained (pop animation)
     this.bambooAtLastHeart = 0;  // bamboo count when the last heart pickup appeared
     this.invincibleTimer = 0;    // > 0 while the panda flashes and can't be hurt
+    this.gapFall = null;         // set while dropping into a gap
+    this.comboPartner = null;    // second half of a designed combo
+    this.lastWasChallenge = false; // last obstacle was a Level-2 type or a combo
+    this.choiceCount = 0;        // obstacles chosen so far (drives the intro)
+    this.introStep = 0;          // position in the level's intro sequence
+    this.hintsShown = new Set(); // first-time hints already shown
+    this.tallRocksSeen = 0;      // the first few tall rocks get an arrow
     this.panda.reset();
     // Distance (px) still to scroll before the next obstacle appears
-    this.distToNextObstacle = CONFIG.START_SPEED * CONFIG.FIRST_OBSTACLE_DELAY;
-    this.nextObstacleType = this.pickObstacleType();
+    this.distToNextObstacle = this.level.startSpeed * CONFIG.FIRST_OBSTACLE_DELAY;
+    this.nextObstacleType = this.chooseNextObstacle();
+  }
+
+  get level() {
+    return LEVELS[this.levelIndex];
+  }
+
+  // Collected over the whole game (for "best this session")
+  get totalCollected() {
+    return this.levelIndex * CONFIG.WIN_TARGET + this.count;
   }
 
   get character() {
@@ -2891,7 +3270,8 @@ class Game {
     return Math.floor(this.count / CONFIG.SPEED_STEP_EVERY);
   }
   get speed() {
-    return Math.min(CONFIG.MAX_SPEED, CONFIG.START_SPEED + this.speedLevel * CONFIG.SPEED_STEP);
+    const L = this.level;
+    return Math.min(L.maxSpeed, CONFIG.MAX_SPEED, L.startSpeed + this.speedLevel * L.speedStep);
   }
 
   // The current colors: a blend between the previous and the current zone.
@@ -2905,13 +3285,20 @@ class Game {
   //  - ground or overhead by OVERHEAD_CHANCE
   //  - a category by CATEGORY_WEIGHTS, then a style in it
   //  - never the same style twice in a row
-  pickObstacleType() {
+  //
+  // Options: category = force a category (intro, combos);
+  //          classic = only Level-1 style obstacles (no new-type stacking).
+  pickObstacleType({ category = null, classic = false } = {}) {
     const zone = ZONES[this.zoneIndex].id;
-    const unlocked = OBSTACLE_TYPES.filter((t) => this.count >= t.minBamboo);
+    const lvl = this.levelIndex + 1;
+    let unlocked = category
+      ? OBSTACLE_TYPES.filter((t) => t.category === category)
+      : OBSTACLE_TYPES.filter((t) => (t.minLevel || 1) <= lvl && (this.level.unlockAll || this.count >= t.minBamboo));
+    if (classic) unlocked = unlocked.filter((t) => (t.minLevel || 1) < 2);
     let pool = CONFIG.ZONES_ENABLED ? unlocked.filter((t) => t.zones.includes(zone)) : unlocked;
     if (!pool.length) pool = unlocked;
     const wantKind = Math.random() < CONFIG.OVERHEAD_CHANCE ? "overhead" : "ground";
-    let choices = pool.filter((t) => t.kind === wantKind);
+    let choices = category ? pool : pool.filter((t) => t.kind === wantKind);
     if (!choices.length) choices = pool;
     if (choices.length > 1) choices = choices.filter((t) => t.id !== this.lastTypeId);
     const cats = [...new Set(choices.map((t) => t.category))];
@@ -2924,13 +3311,74 @@ class Game {
     }
     const type = choose(choices.filter((t) => t.category === cat));
     this.lastTypeId = type.id;
+    this.lastWasChallenge = (type.minLevel || 1) >= 2;
     return type;
+  }
+
+  // Decide the next obstacle. Handles the level intro (one new thing at a
+  // time, starting with the first, with a normal obstacle in between), designed combos, and the rule
+  // that two new-type challenges never come back to back.
+  // Sets this.nextFlags = { comboStart, comboSecond, hint }.
+  chooseNextObstacle() {
+    const L = this.level;
+    const n = this.choiceCount++;
+    this.nextFlags = {};
+    if (this.comboPartner) {
+      const t = this.comboPartner;
+      this.comboPartner = null;
+      this.lastTypeId = t.id;
+      this.lastWasChallenge = true;
+      this.nextFlags = { comboSecond: true };
+      return t;
+    }
+    if (this.introStep < L.intro.length) {
+      if (n % 2 === 0) { // new thing first, then a normal obstacle, and so on
+        const item = L.intro[this.introStep++];
+        return item === "combo" ? this.startCombo() : this.pickObstacleType({ category: item });
+      }
+      return this.pickObstacleType({ classic: true });
+    }
+    if (!this.lastWasChallenge && L.comboChance && Math.random() < L.comboChance) return this.startCombo();
+    return this.pickObstacleType({ classic: this.lastWasChallenge });
+  }
+
+  // A designed combo: a rock then a branch (jump, then duck as you land),
+  // or a branch then a rock (duck, then jump), with a tight comboGap.
+  startCombo() {
+    const groundFirst = Math.random() < 0.5;
+    const rock = this.pickObstacleType({ category: "rock" });
+    const branch = this.pickObstacleType({ category: "branch" });
+    this.comboPartner = groundFirst ? branch : rock;
+    const first = groundFirst ? rock : branch;
+    this.lastTypeId = first.id;
+    this.lastWasChallenge = true;
+    this.nextFlags = { comboStart: true, hint: groundFirst ? "Combo! Jump, then duck" : "Combo! Duck, then jump" };
+    return first;
+  }
+
+  // Show a hint banner the first time something appears
+  showHint(key, text) {
+    if (!text || this.hintsShown.has(key)) return;
+    this.hintsShown.add(key);
+    this.particles.push({ type: "hint", text, x: CONFIG.WIDTH / 2, y: 98, vy: 0, life: 3, max: 3 });
   }
 
   /* ------------------------- State changes ------------------------- */
 
-  start() {
+  // Start a level. lives carries hearts over; bonus = a bonus heart was added.
+  start(levelIndex = 0, lives = CONFIG.START_LIVES, bonus = false) {
+    this.levelIndex = levelIndex;
     this.resetRun();
+    this.lives = lives;
+    this.heartSlots = Math.max(CONFIG.START_LIVES, lives);
+    if (bonus) {
+      this.heartGainedAt[lives - 1] = this.time;
+      this.particles.push({ type: "heart", text: "+1", x: CONFIG.WIDTH - 110, y: 70, vy: -20, life: 1.6, max: 1.6 });
+    }
+    if (levelIndex > 0) {
+      this.particles.push({ type: "zone", text: this.level.name, x: CONFIG.WIDTH / 2, y: 150, vy: -8, life: 2, max: 2 });
+    }
+    this.sound.music.bpm = this.level.musicBpm;
     this.state = "playing";
     this.panda.setDuck(this.keys.has("ArrowDown"));
     // Bamboo in the stretch before the first obstacle, so there is
@@ -2943,6 +3391,8 @@ class Game {
 
   // Character Select screen (the music starts here so the game flows in)
   openSelect() {
+    this.levelIndex = 0;
+    this.sound.music.bpm = LEVELS[0].musicBpm;
     this.resetRun();
     this.state = "select";
     this.selectIndex = this.characterIndex; // last choice is highlighted
@@ -2951,7 +3401,25 @@ class Game {
 
   pickCharacter(i) {
     this.characterIndex = this.selectIndex = i;
-    this.start();
+    this.start(0);
+  }
+
+  // Collected WIN_TARGET in a level that is not the last one
+  levelComplete() {
+    this.state = "levelcomplete";
+    this.endTime = this.time;
+    this.bestScore = Math.max(this.bestScore, this.totalCollected);
+    this.invincibleTimer = 0;
+    this.panda.wantsDuck = false;
+    this.sound.music.stop();
+    this.sound.levelComplete();
+    this.makeConfetti(90);
+  }
+
+  // Lives carry over, plus one bonus heart if below the maximum
+  nextLevel() {
+    const lives = Math.min(CONFIG.MAX_LIVES, this.lives + 1);
+    this.start(this.levelIndex + 1, lives, lives > this.lives);
   }
 
   // Card layout on the Character Select screen
@@ -2993,7 +3461,7 @@ class Game {
     this.hitBy = obstacle.label;
     this.hitMessage = obstacle.type.message || `bonked into a ${obstacle.label}`;
     this.endTime = this.time;
-    this.bestScore = Math.max(this.bestScore, this.count);
+    this.bestScore = Math.max(this.bestScore, this.totalCollected);
     this.panda.wantsDuck = false;
     this.panda.vy = Math.max(this.panda.vy, 0); // stop rising, fall to the ground
     this.invincibleTimer = 0;
@@ -3004,13 +3472,18 @@ class Game {
   win() {
     this.state = "win";
     this.endTime = this.time;
-    this.bestScore = Math.max(this.bestScore, this.count);
+    this.bestScore = Math.max(this.bestScore, this.totalCollected);
     this.invincibleTimer = 0;
     this.sound.music.stop(); // so the jingle plays on its own
     this.sound.win();
-    // Confetti and falling bamboo leaves
+    this.makeConfetti(160);
+  }
+
+  // Confetti plus themed pieces (bamboo leaves, bones or crystals)
+  makeConfetti(count) {
+    this.confetti = [];
     const colors = ["#ff6b6b", "#ffd93d", "#6bcB77", "#4d96ff", "#ff9ff3", "#ffffff"];
-    for (let i = 0; i < 160; i++) {
+    for (let i = 0; i < count; i++) {
       this.confetti.push({
         x: rand(0, CONFIG.WIDTH),
         y: rand(-CONFIG.HEIGHT, 0),
@@ -3039,6 +3512,11 @@ class Game {
       this.showcaseStep(e.shiftKey ? -1 : 1);
       return;
     }
+    // L: debug shortcut straight to Level 2
+    if ((key === "l" || key === "L") && this.state !== "showcase") {
+      this.start(1);
+      return;
+    }
 
     switch (this.state) {
       case "title":
@@ -3063,12 +3541,22 @@ class Game {
         if (key === "p" || key === "P" || key === "Escape" || isStartKey) this.resume();
         break;
       case "gameover":
+        // Space: retry this level (fresh lives). R: back to Level 1.
+        if (isStartKey && this.time - this.endTime > CONFIG.RESTART_DELAY) this.start(this.levelIndex);
+        if (key === "r" || key === "R") this.start(0);
+        if (key === "c" || key === "C") this.openSelect();
+        break;
       case "win":
-        if (isStartKey && this.time - this.endTime > CONFIG.RESTART_DELAY) this.start(); // same character
+        if (isStartKey && this.time - this.endTime > CONFIG.RESTART_DELAY) this.start(0); // same character
+        if (key === "c" || key === "C") this.openSelect();
+        break;
+      case "levelcomplete":
+        if (isStartKey && this.time - this.endTime > CONFIG.LEVEL_COMPLETE_DELAY) this.nextLevel();
         if (key === "c" || key === "C") this.openSelect();
         break;
       case "showcase":
         if (key === "Escape" || isStartKey) {
+          this.levelIndex = 0;
           this.resetRun();
           this.state = "title";
         }
@@ -3121,30 +3609,52 @@ class Game {
     // it keeps spacing exact even if we overshot a little this frame.
     const x = CONFIG.WIDTH + 20 + this.distToNextObstacle;
     const type = this.nextObstacleType;
+    const flags = this.nextFlags || {};
     const obs = new Obstacle(type, x);
     this.obstacles.push(obs);
+    if (type.falls) {
+      // Land a little ahead of the player: visible, avoidable, never on top of them
+      const front = CONFIG.PANDA_X + (CONFIG.PANDA_WIDTH * (1 - CONFIG.HITBOX_INSET)) / 2;
+      obs.landX = front + this.speed * rand(0.12, 0.28);
+    }
+    if (type.needsDoubleJump) obs.showArrow = this.tallRocksSeen++ < 3;
+    if (flags.comboStart) this.showHint("combo", flags.hint);
+    else this.showHint(type.category, type.hint);
 
     // Decide what comes next and how far away it is.
-    const next = this.pickObstacleType();
+    const L = this.level;
+    const next = this.chooseNextObstacle();
     this.nextObstacleType = next;
-    const randomPart = Math.max(CONFIG.RANDOM_GAP_MIN, CONFIG.RANDOM_GAP - this.speedLevel * CONFIG.RANDOM_GAP_SHRINK);
-    let gapTime = CONFIG.MIN_OBSTACLE_GAP + rand(0, randomPart);
-    if (next.kind !== type.kind) gapTime += CONFIG.MIXED_GAP_BONUS; // jump<->duck needs a bit more time
+    const comboNext = this.nextFlags.comboSecond;
+    let gapTime;
+    if (comboNext) {
+      gapTime = L.comboGap; // designed combo: tight but always beatable
+    } else {
+      const randomPart = Math.max(CONFIG.RANDOM_GAP_MIN, L.randomGap - this.speedLevel * L.randomGapShrink);
+      gapTime = CONFIG.MIN_OBSTACLE_GAP + rand(0, randomPart);
+      if (next.kind !== type.kind) gapTime += CONFIG.MIXED_GAP_BONUS; // jump<->duck needs a bit more time
+      if (type.isGap) gapTime += CONFIG.GAP_LANDING_BONUS;            // clear ground after a gap
+    }
     // Convert time to pixels. We use the speed one step faster than now, in
     // case the player speeds up before reaching the next obstacle; that way
     // the minimum gap in seconds is still respected.
-    const safeSpeed = Math.min(CONFIG.MAX_SPEED, this.speed + CONFIG.SPEED_STEP);
+    const safeSpeed = Math.min(L.maxSpeed, CONFIG.MAX_SPEED, this.speed + L.speedStep);
     let gapPx = obs.w + gapTime * safeSpeed;
-    // A bird flies faster than the ground, so it catches up on whatever is in
-    // front of it. Add the distance it can gain before it reaches the panda.
-    if (next.movesFaster) gapPx += ((CONFIG.WIDTH + 20 - CONFIG.PANDA_X) * CONFIG.BIRD_EXTRA_SPEED) / this.speed;
+    // Birds and boulders move faster than the ground, so they catch up on
+    // whatever is in front of them. Add the distance they can gain while
+    // anything ahead of them is still on screen.
+    const extra = extraSpeedOf(next);
+    const catchUp = extra ? ((CONFIG.WIDTH + 60) * extra) / this.speed : 0;
+    gapPx += catchUp;
     this.distToNextObstacle += gapPx;
-    const nextObstacleX = obs.x + gapPx;
+    const nextObstacleX = obs.x + gapPx - catchUp;
 
     // Optional reward tied to this obstacle: a rare heart, or a bamboo stick
     const bw = CONFIG.BAMBOO_WIDTH;
     if (this.maybeSpawnHeart(obs)) {
       // the heart is the reward this time
+    } else if (type.noReward) {
+      // nothing on top of tall rocks, falling or rolling things
     } else if (obs.kind === "ground" && Math.random() < CONFIG.ROCK_REWARD_CHANCE) {
       // Floating above the obstacle: grabbed by jumping over it
       this.bamboos.push(new Bamboo(obs.x + obs.w / 2 - bw / 2, CONFIG.BAMBOO_REWARD_HEIGHT));
@@ -3154,7 +3664,8 @@ class Game {
     }
 
     // Bamboo patterns in the empty stretch between this obstacle and the next
-    this.placeBambooPatterns(obs.x + obs.w, nextObstacleX);
+    // (not inside a tight combo)
+    if (!comboNext) this.placeBambooPatterns(obs.x + obs.w, nextObstacleX);
   }
 
   // Rarely put a heart pickup above a ground obstacle (jump to get it) or
@@ -3163,7 +3674,7 @@ class Game {
     if (this.lives >= CONFIG.MAX_LIVES) return false;        // already full
     if (this.pickups.length) return false;                    // one at a time
     if (this.count - this.bambooAtLastHeart < CONFIG.HEART_MIN_BAMBOO_GAP) return false;
-    if (obs.type.movesFaster) return false;                   // not tied to a bird
+    if (obs.type.movesFaster || obs.type.noReward) return false; // not on moving / tall / falling things
     if (Math.random() >= CONFIG.HEART_SPAWN_CHANCE) return false;
     const hw = 26;
     if (obs.kind === "ground") {
@@ -3251,24 +3762,48 @@ class Game {
         this.updateParticles(dt);
         break;
       case "win":
+      case "levelcomplete":
         this.updateParticles(dt);
         this.updateConfetti(dt);
         break;
-      case "showcase":
+      case "showcase": {
+        const it = this.showcaseItem;
+        if (it && "travel" in it) it.travel += dt * 200;
+        if (it && it.type && it.type.falls) {
+          // Loop the fall: shadow, drop, land, break
+          const c = this.time % 2.6;
+          it.timeToLand = 1.1 - c;
+          it.landedFor = Math.max(0, c - 1.1);
+        }
         if (this.showcaseItem && "age" in this.showcaseItem) this.showcaseItem.age += dt;
         if (this.showcaseItem && "phase" in this.showcaseItem) this.showcaseItem.phase += dt * 3;
         break;
+      }
       // "paused": nothing moves
     }
   }
 
   updatePlaying(dt) {
+    if (this.gapFall) {
+      this.updateGapFall(dt);
+      return;
+    }
     const speed = this.speed;
     this.background.update(dt, speed * CONFIG.PARALLAX_GROUND);
     this.zoneBlend = Math.min(1, this.zoneBlend + dt / CONFIG.ZONE_FADE_TIME);
 
     // Panda physics (legs animate faster when the world is faster)
-    if (this.panda.update(dt, speed / CONFIG.START_SPEED)) this.sound.jump();
+    if (this.panda.update(dt, speed / LEVELS[0].startSpeed)) this.sound.jump();
+    if (this.panda.didDoubleJump) {
+      // Double jump: a puff of cloud under the feet and its own sound
+      this.panda.didDoubleJump = false;
+      this.sound.doubleJump();
+      for (let i = 0; i < 6; i++) {
+        this.particles.push({ type: "puff", x: this.panda.x + rand(-16, 16), y: this.panda.y + rand(-4, 4),
+          vx: rand(-40, 40) - speed * 0.3, vy: rand(10, 40), life: 0.45, max: 0.45 });
+      }
+      this.particles.push({ type: "spark", x: this.panda.x, y: this.panda.y + 4, vx: -speed * 0.3, vy: 30, life: 0.4, max: 0.4, color: "#ffffff" });
+    }
     // Unicorn: a little sparkle trail drifting off behind her
     if (this.character.sparkleTrail) {
       this.trailTimer += dt;
@@ -3311,13 +3846,23 @@ class Game {
       if (overlaps(pandaBox, this.pickups[i].getHitbox())) this.collectHeart(this.pickups.splice(i, 1)[0]);
     }
 
+    // Gaps: standing over one means falling in (even while flashing).
+    for (const o of this.obstacles) {
+      if (!o.type.isGap || o.hasHit) continue;
+      if (o.getHitboxes().some((box) => overlaps(pandaBox, box))) {
+        o.hasHit = true;
+        this.startGapFall(o);
+        return;
+      }
+    }
+
     // Touching an obstacle costs a heart, unless the panda is still flashing
     // from the last hit. Each obstacle can only ever hurt him once.
     if (this.invincibleTimer > 0) {
       this.invincibleTimer = Math.max(0, this.invincibleTimer - dt);
     } else {
       for (const o of this.obstacles) {
-        if (o.hasHit) continue;
+        if (o.hasHit || o.type.isGap) continue;
         if (o.getHitboxes().some((box) => overlaps(pandaBox, box))) {
           o.hasHit = true;
           this.loseLife(o);
@@ -3328,6 +3873,44 @@ class Game {
     }
 
     this.updateParticles(dt);
+  }
+
+  // Falling into a gap: drop out of view (the world pauses), then respawn
+  // on solid ground just past the gap.
+  startGapFall(gap) {
+    this.gapFall = { t: 0, gap };
+    this.panda.onGround = false;
+    this.panda.wantsDuck = false;
+    this.panda.vy = 150;
+    this.sound.fall();
+  }
+
+  updateGapFall(dt) {
+    const f = this.gapFall;
+    f.t += dt;
+    this.panda.vy += CONFIG.GRAVITY * dt;
+    this.panda.y += this.panda.vy * dt;
+    this.updateParticles(dt);
+    if (f.t < CONFIG.GAP_FALL_TIME) return;
+    this.gapFall = null;
+    // Scroll the world forward so the gap is behind the player
+    const pandaLeft = this.panda.x - CONFIG.PANDA_WIDTH / 2;
+    const shift = Math.max(0, f.gap.x + f.gap.w + 12 - pandaLeft);
+    for (const list of [this.obstacles, this.bamboos, this.pickups]) for (const it of list) it.x -= shift;
+    this.background.scroll += shift;
+    this.distToNextObstacle = Math.max(0, this.distToNextObstacle - shift);
+    const p = this.panda;
+    p.y = CONFIG.GROUND_Y;
+    p.vy = 0;
+    p.onGround = true;
+    p.doubleJumped = false;
+    p.setDuck(this.keys.has("ArrowDown"));
+    if (this.invincibleTimer > 0) {
+      // Already flashing from a hit: no extra heart lost
+      this.invincibleTimer = Math.max(this.invincibleTimer, 1);
+      return;
+    }
+    this.loseLife(f.gap);
   }
 
   loseLife(obstacle) {
@@ -3365,11 +3948,13 @@ class Game {
       });
     }
     if (this.count >= CONFIG.WIN_TARGET) {
-      this.win();
+      // Last level: you win. Otherwise: on to the next level.
+      if (this.levelIndex < LEVELS.length - 1) this.levelComplete();
+      else this.win();
       return;
     }
     if (this.count % CONFIG.SPEED_STEP_EVERY === 0 &&
-        CONFIG.START_SPEED + this.speedLevel * CONFIG.SPEED_STEP <= CONFIG.MAX_SPEED) {
+        this.level.startSpeed + this.speedLevel * this.level.speedStep <= Math.min(this.level.maxSpeed, CONFIG.MAX_SPEED)) {
       this.sound.levelUp();
       this.particles.push({ type: "banner", text: "Faster!", x: CONFIG.WIDTH / 2, y: 120, vy: -15, life: 1.3, max: 1.3 });
     }
@@ -3432,7 +4017,7 @@ class Game {
       this.drawSelect(ctx);
       return;
     }
-    this.background.draw(ctx, this.palette);
+    this.background.draw(ctx, this.palette, this.state === "title" ? null : this.level.skyTint);
     for (const b of this.bamboos) b.draw(ctx, this.character, this.time);
     for (const h of this.pickups) h.draw(ctx);
     for (const o of this.obstacles) o.draw(ctx, this.time);
@@ -3441,23 +4026,32 @@ class Game {
     let mode = "run";
     if (this.state === "title") mode = "idle";
     else if (this.state === "gameover" && this.panda.onGround) mode = "dizzy";
-    else if (this.state === "win") mode = "happy";
-    if (this.state === "win") {
+    else if (this.state === "win" || this.state === "levelcomplete") mode = "happy";
+    if (this.state === "win" || this.state === "levelcomplete") {
       // Happy hopping
       this.panda.y = CONFIG.GROUND_Y - Math.abs(Math.sin((this.time - this.endTime) * 6)) * 28;
     }
     if (this.flashHidden) ctx.globalAlpha = 0.25; // blink while invincible
+    ctx.save();
+    if (this.gapFall) {
+      // Falling into a hole: hide everything below the ground line
+      ctx.beginPath();
+      ctx.rect(0, 0, CONFIG.WIDTH, CONFIG.GROUND_Y + 2);
+      ctx.clip();
+    }
     this.panda.draw(ctx, mode, this.time, this.character);
+    ctx.restore();
     ctx.globalAlpha = 1;
 
     this.drawParticles(ctx);
-    if (this.state === "win") this.drawConfetti(ctx);
+    if (this.state === "win" || this.state === "levelcomplete") this.drawConfetti(ctx);
     if (this.state !== "title") this.drawHUD(ctx);
 
     if (this.state === "title") this.drawTitle(ctx);
     else if (this.state === "paused") this.drawPaused(ctx);
     else if (this.state === "gameover") this.drawGameOver(ctx);
     else if (this.state === "win") this.drawWin(ctx);
+    else if (this.state === "levelcomplete") this.drawLevelComplete(ctx);
 
     if (this.debug) this.drawDebug(ctx);
   }
@@ -3473,6 +4067,11 @@ class Game {
       } else if (p.type === "heart") {
         drawText(ctx, p.text, p.x, p.y, 22, "#ffffff", { stroke: "#c2185b", strokeWidth: 5 });
         drawHeart(ctx, p.x + 26, p.y, 18, "#ff3b4f", "#9b1020");
+      } else if (p.type === "hint") {
+        drawText(ctx, p.text, p.x, p.y, 22, "#ffffff", { stroke: "#1d3f73", strokeWidth: 6 });
+      } else if (p.type === "puff") {
+        const k = 1 - p.life / p.max;
+        ellipse(ctx, p.x, p.y, 5 + k * 9, 3.5 + k * 5, 0, "rgba(255,255,255,0.85)");
       } else if (p.type === "zone") {
         drawText(ctx, p.text, p.x, p.y, 26, "#ffffff", { stroke: "#2f5d1a", strokeWidth: 6 });
       } else if (p.type === "banner") {
@@ -3504,12 +4103,13 @@ class Game {
   drawHUD(ctx) {
     // Panel in the top-left corner
     ctx.save();
-    roundRectPath(ctx, 12, 10, 200, 58, 12);
+    roundRectPath(ctx, 12, 10, 240, 58, 12);
     ctx.fillStyle = "rgba(255,255,255,0.8)";
     ctx.fill();
     ctx.restore();
     this.character.drawCollectible(ctx, 34, 16, 40, this.time, 1);
     drawText(ctx, `${this.count} / ${CONFIG.WIN_TARGET}`, 58, 30, 24, this.character.accent, { align: "left" });
+    drawText(ctx, this.level.name, 242, 30, 14, "#555", { align: "right" });
 
     // Progress bar toward the goal
     const bx = 58, by = 46, bw = 140, bh = 12;
@@ -3598,9 +4198,9 @@ class Game {
     drawBambooStalk(ctx, 722, 48, 46);
     drawPanel(ctx, 320, 120, 400, 170);
     drawText(ctx, `↑ Jump,  ↓ Duck,  collect ${CONFIG.WIN_TARGET} ${this.character.collectible.many}!`, 520, 152, 19, "#2f5d1a");
-    drawText(ctx, "Jump over rocks  •  Duck under branches", 520, 184, 15, "#555");
+    drawText(ctx, "Jump over rocks  •  Duck under branches  •  ↑↑ double jump", 520, 184, 14, "#555");
     drawText(ctx, `Hold ↓ in the air to drop faster  •  ${CONFIG.START_LIVES} lives`, 520, 206, 15, "#555");
-    drawText(ctx, "P / Esc pause  •  M mute  •  H hitboxes  •  O gallery", 520, 228, 13, "#777");
+    drawText(ctx, "P / Esc pause  •  M mute  •  H hitboxes  •  O gallery  •  L Level 2", 520, 228, 12, "#777");
     if (Math.floor(this.time * 2) % 2 === 0) {
       drawText(ctx, "Press Space to Start", 520, 264, 24, "#d35400");
     }
@@ -3616,25 +4216,26 @@ class Game {
 
   drawGameOver(ctx) {
     const many = this.character.collectible.many;
-    drawPanel(ctx, 150, 60, 500, 200);
-    drawText(ctx, `Oops! ${capitalize(this.character.the)} ${this.hitMessage}!`, 400, 95, 21, "#c0392b");
-    drawText(ctx, `${capitalize(many)} this run: ${this.count}`, 400, 135, 20, this.character.accent);
-    drawText(ctx, `Best this session: ${this.bestScore}`, 400, 165, 18, "#555");
+    drawPanel(ctx, 200, 72, 500, 200);
+    drawText(ctx, `Oops! ${capitalize(this.character.the)} ${this.hitMessage}!`, 450, 107, 21, "#c0392b");
+    drawText(ctx, `${capitalize(many)} this run: ${this.count}`, 450, 147, 20, this.character.accent);
+    drawText(ctx, `Best this session: ${this.bestScore} ${many} in total`, 450, 177, 16, "#555");
     if (this.time - this.endTime > CONFIG.RESTART_DELAY && Math.floor(this.time * 2) % 2 === 0) {
-      drawText(ctx, "Press Space to try again", 400, 207, 20, "#d35400");
+      drawText(ctx, this.levelIndex > 0 ? `Press Space to retry ${this.level.name}` : "Press Space to try again", 450, 217, 20, "#d35400");
     }
-    drawText(ctx, "C: choose another character", 400, 238, 14, "#777");
+    drawText(ctx, this.levelIndex > 0 ? "R: restart from Level 1   •   C: choose another character" : "C: choose another character",
+      450, 250, 14, "#777");
   }
 
   drawWin(ctx) {
-    drawPanel(ctx, 150, 60, 500, 196);
-    drawText(ctx, "🎉", 400, 90, 26, "#000");
-    drawText(ctx, `You collected ${CONFIG.WIN_TARGET} ${this.character.collectible.many}! You win!`, 400, 128, 21, this.character.accent);
-    drawText(ctx, `Best this session: ${this.bestScore}`, 400, 160, 17, "#555");
+    drawPanel(ctx, 200, 72, 500, 206);
+    drawText(ctx, `🎉 You beat ${this.level.name}! 🎉`, 450, 106, 26, "#c0392b");
+    drawText(ctx, `You collected ${CONFIG.WIN_TARGET} ${this.character.collectible.many}! You win!`, 450, 146, 21, this.character.accent);
+    drawText(ctx, `Best this session: ${this.bestScore} in total`, 450, 180, 16, "#555");
     if (this.time - this.endTime > CONFIG.RESTART_DELAY && Math.floor(this.time * 2) % 2 === 0) {
-      drawText(ctx, "Press Space to play again", 400, 200, 20, "#d35400");
+      drawText(ctx, "Press Space to play again", 450, 222, 20, "#d35400");
     }
-    drawText(ctx, "C: choose another character", 400, 232, 14, "#777");
+    drawText(ctx, "C: choose another character", 450, 254, 14, "#777");
   }
 
   // Hitbox outlines (press H)
@@ -3645,8 +4246,30 @@ class Game {
     for (const o of this.obstacles) for (const b of o.getHitboxes()) outline(b, "#ff1744");
     for (const b of this.bamboos) outline(b.getHitbox(), "#ffab00");
     for (const h of this.pickups) outline(h.getHitbox(), "#ff4fa3");
-    drawText(ctx, `DEBUG  speed ${Math.round(this.speed)} px/s  fps ${Math.round(this.fps)}`,
+    drawText(ctx, `DEBUG  ${this.level.name}  speed ${Math.round(this.speed)} px/s  fps ${Math.round(this.fps)}`,
       CONFIG.WIDTH - 14, 66, 12, "#b00020", { align: "right" });
+  }
+
+  // "Level 1 Complete!" -> "Level 2: Get ready!" -> "Press Space to continue"
+  drawLevelComplete(ctx) {
+    const t = this.time - this.endTime;
+    const next = LEVELS[this.levelIndex + 1];
+    drawPanel(ctx, 210, 76, 480, 214);
+    const pop = Math.min(1, t * 3);
+    ctx.save();
+    ctx.translate(450, 116);
+    ctx.scale(0.6 + 0.4 * pop, 0.6 + 0.4 * pop);
+    drawText(ctx, `${this.level.name} Complete!`, 0, 0, 34, "#ffffff", { stroke: this.character.accent, strokeWidth: 8 });
+    ctx.restore();
+    drawText(ctx, `You collected ${CONFIG.WIN_TARGET} ${this.character.collectible.many}!`, 450, 156, 18, "#555");
+    if (t > 0.8) {
+      drawText(ctx, `${next.name}: Get ready!`, 450, 192, 24, "#c0392b");
+      const bonus = this.lives < CONFIG.MAX_LIVES;
+      drawText(ctx, bonus ? "Your hearts carry over, plus 1 bonus heart" : "Your hearts carry over", 450, 220, 14, "#777");
+    }
+    if (t > CONFIG.LEVEL_COMPLETE_DELAY && Math.floor(this.time * 2) % 2 === 0) {
+      drawText(ctx, "Press Space to continue", 450, 258, 20, "#d35400");
+    }
   }
 
   // Character Select: three cards, the highlighted one glows and bounces.
@@ -3723,7 +4346,7 @@ class Game {
       title = t.name;
       line2 = `${t.kind === "ground" ? "Ground: jump over" : "Overhead: duck under"}  •  ${t.category}`;
       line3 = `Zones: ${t.zones.join(", ")}`;
-      line4 = `Appears from ${t.minBamboo} bamboo`;
+      line4 = (t.minLevel || 1) >= 2 ? `Level ${t.minLevel} only` : `Appears from ${t.minBamboo} bamboo`;
     }
     drawText(ctx, `${this.showcaseIndex + 1} / ${total}   ${title}`, 26, 32, 16, "#2f5d1a", { align: "left" });
     drawText(ctx, line2, 26, 55, 13, "#555", { align: "left" });
@@ -3772,6 +4395,22 @@ class Game {
    Self-check: verify with plain math that the level design is fair.
    Results are printed in the browser console (F12).
    ===================================================================== */
+// Longest time the panda's feet stay at least needH above the ground:
+// one jump, or (double) a jump plus a double jump at the top of the arc.
+function airborneAbove(needH, double) {
+  const C = CONFIG, dt = 1 / 1000;
+  let y = 0, vy = C.JUMP_VELOCITY, used = false, best = 0, run = 0;
+  for (let t = 0; t < 3; t += dt) {
+    if (double && !used && vy <= 0) { vy = C.DOUBLE_JUMP_VELOCITY; used = true; }
+    vy -= C.GRAVITY * dt;
+    y += vy * dt;
+    if (y < 0) break;
+    run = y >= needH ? run + dt : 0;
+    best = Math.max(best, run);
+  }
+  return best;
+}
+
 function runSelfChecks() {
   const C = CONFIG;
   const results = [];
@@ -3781,28 +4420,37 @@ function runSelfChecks() {
   const feetInset = C.GROUND_Y - (standing.y + standing.h); // hitbox bottom sits this far above the feet
 
   const airTime = (2 * C.JUMP_VELOCITY) / C.GRAVITY;
+  const peakDouble = peak + (C.DOUBLE_JUMP_VELOCITY ** 2) / (2 * C.GRAVITY);
+  results.push({ check: "double jump stays on screen", ok: C.GROUND_Y - peakDouble - C.PANDA_HEIGHT > 0,
+    detail: `highest head position y = ${(C.GROUND_Y - peakDouble - C.PANDA_HEIGHT).toFixed(0)}` });
   const lowBamboo = insetBox(0, C.GROUND_Y - C.BAMBOO_GROUND_HEIGHT - C.BAMBOO_HEIGHT, C.BAMBOO_WIDTH, C.BAMBOO_HEIGHT);
   const lowHeart = insetBox(0, C.GROUND_Y - C.BAMBOO_GROUND_HEIGHT - 24, 26, 24);
   let lowestOverhead = 0;
 
   // Build many random copies of every registry entry and check each one.
   for (const type of OBSTACLE_TYPES) {
-    let ok = true, detail = "", worst = -Infinity; // report the hardest copy
+    let ok = true, detail = "", worst = -Infinity, hitsStanding = false; // report the hardest copy
     for (let i = 0; i < 60; i++) {
       const o = new Obstacle(type, 0);
-      o.age = Math.random() * 10; // birds bob over time
+      o.age = Math.random() * 10; // birds bob / swoop over time
+      if (type.falls) { o.timeToLand = 0; o.landedFor = 0.01; } // check it as landed
+      if (type.isGap && i === 0) o.w = C.GAP_MAX_WIDTH;         // always test the widest gap
       const raw = type.boxes(o);
       const boxes = o.getHitboxes();
       if (type.kind === "ground") {
-        // Jump over: is the panda high enough for long enough at top speed?
+        // Jump over: is the panda high enough for long enough? The slowest
+        // speed is the hardest case (the obstacle takes longest to pass).
         const rawHeight = C.GROUND_Y - Math.min(...raw.map((b) => b.y));
         const top = Math.min(...boxes.map((b) => b.y));
         const span = Math.max(...boxes.map((b) => b.x + b.w)) - Math.min(...boxes.map((b) => b.x));
         const needH = Math.max(0, C.GROUND_Y - top - feetInset);
-        const timeAbove = (2 * Math.sqrt(C.JUMP_VELOCITY ** 2 - 2 * C.GRAVITY * needH)) / C.GRAVITY;
-        const timeNeeded = (standing.w + span) / C.MAX_SPEED;
+        const slowest = Math.min(...LEVELS.slice((type.minLevel || 1) - 1).map((L) => L.startSpeed)) + extraSpeedOf(type);
+        const timeNeeded = (standing.w + span) / slowest;
+        const timeAbove = type.needsDoubleJump ? airborneAbove(needH, true) : airborneAbove(needH, false);
+        const maxHeight = type.needsDoubleJump ? C.TALL_ROCK_HEIGHT : C.GROUND_OBSTACLE_MAX_HEIGHT;
         // Require 1.5x the minimum so the take-off point is comfortable, not pixel-perfect
-        const good = rawHeight <= C.GROUND_OBSTACLE_MAX_HEIGHT && needH < peak && timeAbove > timeNeeded * 1.5;
+        let good = rawHeight <= maxHeight && timeAbove > timeNeeded * 1.5;
+        if (type.isGap) good = good && o.w <= C.GAP_MAX_WIDTH;
         const hardness = good ? timeNeeded / timeAbove : Infinity;
         if (hardness > worst) {
           worst = hardness;
@@ -3815,7 +4463,11 @@ function runSelfChecks() {
         const rawBottom = Math.max(...raw.map((b) => b.y + b.h));
         const bottom = Math.max(...boxes.map((b) => b.y + b.h));
         lowestOverhead = Math.max(lowestOverhead, bottom);
-        const good = rawBottom <= C.GROUND_Y - C.BRANCH_CLEARANCE && ducking.y >= bottom && standing.y < bottom;
+        // (swooping birds rise above a standing head part of the time; they
+        // only need to hit a standing panda at their lowest point)
+        const good = rawBottom <= C.GROUND_Y - C.BRANCH_CLEARANCE && ducking.y >= bottom &&
+          (standing.y < bottom || type.category === "swoopbird");
+        if (standing.y < bottom) hitsStanding = true;
         const hardness = good ? bottom : Infinity;
         if (hardness > worst) {
           worst = hardness;
@@ -3824,7 +4476,33 @@ function runSelfChecks() {
         if (!good) ok = false;
       }
     }
-    results.push({ check: `${type.name}: ${type.kind === "ground" ? "jumpable" : "duckable"}`, ok, detail });
+    if (type.kind === "overhead" && !hitsStanding) { ok = false; detail += " (never low enough to matter)"; }
+    const how = type.kind === "overhead" ? "duckable" : type.needsDoubleJump ? "double-jumpable" : "jumpable";
+    results.push({ check: `${type.name}: ${how}`, ok, detail });
+    // Moving obstacles: enough time to react even at top speed
+    if (extraSpeedOf(type)) {
+      const react = (C.WIDTH - C.PANDA_X) / (C.MAX_SPEED + extraSpeedOf(type));
+      results.push({ check: `${type.name}: reaction time at top speed`, ok: react >= 0.8, detail: `${react.toFixed(2)}s on screen before it arrives` });
+    }
+    // Tall rocks must really need the double jump (one jump falls short even at top speed)
+    if (type.needsDoubleJump) {
+      const o = new Obstacle(type, 0);
+      const boxes = o.getHitboxes();
+      const needH = C.GROUND_Y - Math.min(...boxes.map((b) => b.y)) - feetInset;
+      const span = Math.max(...boxes.map((b) => b.x + b.w)) - Math.min(...boxes.map((b) => b.x));
+      const single = airborneAbove(needH, false), need = (standing.w + span) / C.MAX_SPEED;
+      results.push({ check: `${type.name}: a single jump is not enough`, ok: single < need,
+        detail: `single jump ${single.toFixed(2)}s vs ${need.toFixed(2)}s needed at top speed` });
+    }
+  }
+
+  // Designed combos: after jumping the smallest rock you land with time to duck
+  for (const L of LEVELS) {
+    if (!L.comboChance) continue;
+    const rockW = Math.min(...C.ROCK_SIZES.map((r) => r.w)) * (1 - C.HITBOX_INSET);
+    const slack = L.comboGap + rockW / C.MAX_SPEED - (airTime - 0.04);
+    results.push({ check: `${L.name} combos: time to duck after landing`, ok: slack >= 0.12,
+      detail: `${slack.toFixed(2)}s between landing and the branch arriving (worst case)` });
   }
 
   // Rewards placed under overhead obstacles must not touch them
